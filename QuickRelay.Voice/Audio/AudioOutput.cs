@@ -10,7 +10,8 @@ public sealed record AudioOptions
     public string StyleName { get; init; } = "ノーマル";
     public int? StyleId { get; init; }
     public int? OutputDevice { get; init; }
-    public VoiceTuning Tuning { get; init; } = new();
+    public double Speed { get; init; } = 1.08;
+    public double Volume { get; init; } = 1;
     public IReadOnlyList<string> WarmupTexts { get; init; } = [];
 }
 
@@ -43,8 +44,10 @@ public sealed class AudioOutput : IAsyncDisposable
     public AudioOutput(AudioOptions options, HttpClient? httpClient = null)
     {
         ArgumentNullException.ThrowIfNull(options);
-        if (options.Tuning is not { IsValid: true })
-            throw new ArgumentOutOfRangeException(nameof(options), "AivisSpeechの音声パラメーターが範囲外です。");
+        if (!double.IsFinite(options.Speed) || options.Speed is < 0.5 or > 2)
+            throw new ArgumentOutOfRangeException(nameof(options), "読み上げ速度は0.5〜2です。");
+        if (!double.IsFinite(options.Volume) || options.Volume is < 0 or > 2)
+            throw new ArgumentOutOfRangeException(nameof(options), "音量は0〜2です。");
         if (options.OutputDevice < 0)
             throw new ArgumentOutOfRangeException(nameof(options), "出力機器の番号が無効です。");
 
@@ -54,8 +57,8 @@ public sealed class AudioOutput : IAsyncDisposable
         if (warmupTexts.Length > 16 || warmupTexts.Any(text => text.Length > AivisClient.MaxTextLength))
             throw new ArgumentException("固定音声は最大16件、1件500文字です。", nameof(options));
         engine = new AivisClient(options, httpClient);
-        alert = WaveClip.CreateSignal(AudioSignal.Alert, options.Tuning.Volume);
-        engineError = WaveClip.CreateSignal(AudioSignal.EngineError, options.Tuning.Volume);
+        alert = WaveClip.CreateSignal(AudioSignal.Alert, options.Volume);
+        engineError = WaveClip.CreateSignal(AudioSignal.EngineError, options.Volume);
     }
 
     public static IReadOnlyList<AudioDevice> ListDevices() => WinMmPlayer.ListDevices();

@@ -29,23 +29,22 @@ public sealed class VoiceController : IDisposable
     private string markFile = "";
     private AudioOutput? audio;
     private SpeechJob? current;
-    private CancellationTokenSource? playing, manualTest, connection, preparing;
+    private CancellationTokenSource? playing, manualTest, connection;
     private Task playCompletion = Task.CompletedTask;
     private Task connectionTask = Task.CompletedTask;
-    private Task preparation = Task.CompletedTask;
 
     public VoiceController()
     {
         status = new VoiceStatus();
         try
         {
-            settings = (LocalFiles.Read<AppSettings>("settings.json", 64 * 1024) ?? new()).Normalize();
+            settings = LocalFiles.Read<AppSettings>("settings.json", 64 * 1024) ?? new();
             if (settings.Environment != AppSettings.FeedEnvironment)
                 settings = settings with { Environment = AppSettings.FeedEnvironment, Muted = true, ForecastEnabled = false };
             if (!string.IsNullOrWhiteSpace(settings.FeedUrl))
                 settings.Validate();
             else
-                settings = new AppSettings { Muted = settings.Muted }.WithVoiceFrom(settings).WithResidencyFrom(settings);
+                settings = new AppSettings { Muted = settings.Muted };
             var savedToken = CredentialVault.Read(settings.Scope);
             hasToken = savedToken is not null && !IsRevoked(TokenScope(settings.Scope, savedToken));
         }
@@ -82,7 +81,7 @@ public sealed class VoiceController : IDisposable
         LocalFiles.Write("settings.json", selected);
         var cursorFile = $"feed-prc-{tokenScope}.json";
         var announcementFile = $"speech-{scope}.json";
-        var speaker = NewAudio(selected, SpeechPolicy.FixedWarning);
+        var speaker = NewAudio(selected.AivisPort, selected.StyleId, SpeechPolicy.FixedWarning);
         lock (gate)
         {
             Dictionary<string, string>? readings = null;
@@ -119,29 +118,24 @@ public sealed class VoiceController : IDisposable
             var ct = connection.Token;
             SetStatus(status with { Connection = "接続中", Cursor = CursorText(state?.Cursor), Engine = "確認中",
                 Output = !storageHealthy ? "報知履歴エラー" : selected.Muted ? "ミュート" : "未確認" });
-            StartPreparationLocked(speaker, ct);
-            connectionTask = Task.Run(() => RunAsync(endpoint, token, tokenScope, cursorFile, ct));
+            connectionTask = Task.Run(() => RunAsync(endpoint, token, tokenScope, cursorFile, speaker, ct));
         }
     }
 
     public async Task DisconnectAsync()
     {
-        CancellationTokenSource? oldConnection, oldPreparing;
+        CancellationTokenSource? oldConnection;
         AudioOutput? oldAudio;
-        Task oldTask, oldPreparation, oldPlay;
+        Task oldTask, oldPlay;
         lock (gate)
         {
             oldConnection = connection;
             oldTask = connectionTask;
             connection = null;
-            oldPreparing = preparing;
-            oldPreparation = preparation;
-            preparing = null;
             oldAudio = audio;
             audio = null;
             InvalidateFeed();
             Cancel(manualTest);
-            Cancel(oldPreparing);
             oldPlay = playCompletion;
             SetStatus(status with { Connection = "未接続", Upstream = "未確認", Capture = "未確認", Clock = "未確認" });
         }
@@ -151,61 +145,9 @@ public sealed class VoiceController : IDisposable
             try { await oldTask.ConfigureAwait(false); }
             finally { oldConnection.Dispose(); }
         }
-        await oldPreparation.ConfigureAwait(false);
-        oldPreparing?.Dispose();
         await oldPlay.ConfigureAwait(false);
         if (oldAudio is not null)
             await oldAudio.DisposeAsync().ConfigureAwait(false);
-    }
-
-    /// <summary>
-    /// Saves the AivisSpeech choices in <paramref name="source"/>. While connected, new announcements switch to the
-    /// new voice without reconnecting the feed; an announcement already playing finishes with the previous voice.
-    /// </summary>
-    public async Task<bool> SaveVoiceAsync(AppSettings source)
-    {
-        source.ValidateVoice();
-        AudioOutput? oldAudio = null;
-        CancellationTokenSource? oldPreparing = null;
-        Task oldPreparation = Task.CompletedTask, oldPlay = Task.CompletedTask;
-        lock (gate)
-        {
-            var next = settings.WithVoiceFrom(source);
-            try { LocalFiles.Write("settings.json", next); }
-            catch (Exception ex) when (IsStorageError(ex))
-            {
-                throw new InvalidOperationException("AivisSpeech の設定を保存できませんでした。", ex);
-            }
-            settings = next;
-            if (connection is null || audio is null)
-                return false;
-
-            var replacement = NewAudio(next, SpeechPolicy.FixedWarning);
-            oldAudio = audio;
-            audio = replacement;
-            oldPreparing = preparing;
-            oldPreparation = preparation;
-            Cancel(oldPreparing);
-            oldPlay = playCompletion;
-            StartPreparationLocked(replacement, connection.Token);
-            SetStatus(status with { Engine = "確認中" });
-            Log("AivisSpeech の設定を変更しました。警報音声を準備し直します。");
-        }
-        await oldPreparation.ConfigureAwait(false);
-        oldPreparing?.Dispose();
-        await oldPlay.ConfigureAwait(false);
-        await oldAudio.DisposeAsync().ConfigureAwait(false);
-        return true;
-    }
-
-    public void SaveResidency(AppSettings source)
-    {
-        lock (gate)
-        {
-            settings = settings.WithResidencyFrom(source);
-            try { LocalFiles.Write("settings.json", settings); }
-            catch (Exception ex) when (IsStorageError(ex)) { Log("常駐設定の保存に失敗しました。"); }
-        }
     }
 
     public void Mute(bool muted)
@@ -234,16 +176,14 @@ public sealed class VoiceController : IDisposable
     public async Task<IReadOnlyList<VoiceStyle>> ListStylesAsync(int port)
     {
         AppSettings.ValidateAudio(port);
-        await using var engine = NewAudio(new AppSettings { AivisPort = port });
+        await using var engine = NewAudio(port, null);
         var voices = await engine.ListVoicesAsync(lifetime.Token).ConfigureAwait(false);
-        return voices.Select(voice => new VoiceStyle(voice.StyleId, voice.SpeakerUuid, voice.SpeakerName, voice.StyleName))
-            .ToArray();
+        return voices.Select(voice => new VoiceStyle(voice.StyleId, $"{voice.SpeakerName} / {voice.StyleName}")).ToArray();
     }
 
-    /// <summary>Plays a sample with the AivisSpeech choices in <paramref name="voice"/>, saved or not.</summary>
-    public async Task TestAudioAsync(AppSettings voice)
+    public async Task TestAudioAsync(int port, int? styleId)
     {
-        voice.ValidateVoice();
+        AppSettings.ValidateAudio(port);
         using var test = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
         lock (gate)
         {
@@ -254,7 +194,7 @@ public sealed class VoiceController : IDisposable
         }
         try
         {
-            await using var engine = NewAudio(voice);
+            await using var engine = NewAudio(port, styleId);
             await engine.TestAsync(test.Token).ConfigureAwait(false);
             lock (gate) SetStatus(status with { Engine = "接続済み", Output = settings.Muted ? "ミュート" : "テスト完了" });
         }
@@ -274,8 +214,11 @@ public sealed class VoiceController : IDisposable
         }
     }
 
-    private async Task RunAsync(Uri endpoint, string token, string tokenScope, string cursorFile, CancellationToken ct)
+    private async Task RunAsync(Uri endpoint, string token, string tokenScope, string cursorFile, AudioOutput speaker,
+        CancellationToken ct)
     {
+        using var preparing = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        var preparation = PrepareAsync(speaker, preparing.Token);
         var attempt = 0;
         try
         {
@@ -336,20 +279,9 @@ public sealed class VoiceController : IDisposable
         catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
         finally
         {
-            // A feed that stopped for good (for example a revoked token) no longer needs the warning audio.
-            lock (gate)
-                if (!ct.IsCancellationRequested)
-                    Cancel(preparing);
+            await preparing.CancelAsync().ConfigureAwait(false);
+            await preparation.ConfigureAwait(false);
         }
-    }
-
-    private void StartPreparationLocked(AudioOutput speaker, CancellationToken connectionToken)
-    {
-        var source = CancellationTokenSource.CreateLinkedTokenSource(connectionToken);
-        var ct = source.Token;
-        preparing = source;
-        warningPrepared = false;
-        preparation = Task.Run(() => PrepareAsync(speaker, ct));
     }
 
     private async Task PrepareAsync(AudioOutput speaker, CancellationToken ct)
@@ -741,14 +673,9 @@ public sealed class VoiceController : IDisposable
         return keys;
     }
 
-    private static AudioOutput NewAudio(AppSettings voice, string? fixedWarning = null) =>
-        new(new AudioOptions
-        {
-            EngineUrl = $"http://127.0.0.1:{voice.AivisPort}", StyleId = voice.StyleId,
-            SpeakerUuid = string.IsNullOrWhiteSpace(voice.SpeakerUuid) ? null : voice.SpeakerUuid,
-            StyleName = string.IsNullOrWhiteSpace(voice.StyleName) ? new AudioOptions().StyleName : voice.StyleName,
-            Tuning = voice.Tuning, WarmupTexts = fixedWarning is null ? [] : [fixedWarning]
-        });
+    private static AudioOutput NewAudio(int port, int? styleId, string? fixedWarning = null) =>
+        new(new AudioOptions { EngineUrl = $"http://127.0.0.1:{port}", StyleId = styleId,
+            WarmupTexts = fixedWarning is null ? [] : [fixedWarning] });
 
     public void Dispose()
     {
