@@ -5,8 +5,9 @@ namespace QuickRelay.Voice;
 
 public sealed record AppSettings
 {
+    internal const string FeedEnvironment = "production";
     public string FeedUrl { get; init; } = "";
-    public string Environment { get; init; } = "production";
+    public string Environment { get; init; } = FeedEnvironment;
     public bool Muted { get; init; } = true;
     public bool Nationwide { get; init; } = true;
     public string[] Regions { get; init; } = [];
@@ -22,8 +23,8 @@ public sealed record AppSettings
             || uri.Scheme != "wss" || uri.AbsolutePath != "/v1/eew"
             || uri.UserInfo.Length != 0 || uri.Query.Length != 0 || uri.Fragment.Length != 0)
             throw new ArgumentException("接続先は wss://ホスト/v1/eew の形式で入力してください。");
-        if (Environment is not ("production" or "training" or "test"))
-            throw new ArgumentException("受信環境を選択してください。");
+        if (Environment != FeedEnvironment)
+            throw new ArgumentException("QuickRelay の現在の配信環境は production です。");
         if (Regions is null || (!Nationwide && (Regions.Length == 0 || Regions.Length > 250
             || Regions.Any(region => region is null || region.Split(':') is not [var type, var code]
                 || string.IsNullOrWhiteSpace(type) || string.IsNullOrWhiteSpace(code)))))

@@ -52,7 +52,7 @@ public static class SpeechPolicy
         IReadOnlyList<SpeechMark> marks, DateTimeOffset now)
     {
         if (earthquake.GetSeries(kind) is not { Status: SeriesStatus.Canceled } series
-            || series.Source is not { InfoType: InfoType.Cancel, Origin: SourceOrigin.Live or SourceOrigin.Recovered }
+            || series.Source is not { InfoType: InfoType.Cancel, Origin: SourceOrigin.Live }
             || Window(series.Source, series.SpeechUntil, 30, now) is not { } deadline)
             return null;
         var history = marks.Where(mark => mark.EventId == earthquake.EventId && mark.Series == kind);
@@ -168,7 +168,7 @@ public static class SpeechPolicy
     private static string ReadName(string original, IReadOnlyDictionary<string, string>? readings)
         => readings?.TryGetValue(original, out var pronunciation) == true
             && !string.IsNullOrWhiteSpace(pronunciation) && pronunciation.Length <= 60 && !pronunciation.Any(char.IsControl)
-            ? pronunciation : original.Length <= 60 ? original : "対象地域";
+            ? pronunciation : !string.IsNullOrWhiteSpace(original) && original.Length <= 60 ? original : "対象地域";
 
     private static DateTimeOffset? Window(FeedSource source, DateTimeOffset? deadline, int seconds, DateTimeOffset now)
     {

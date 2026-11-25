@@ -21,7 +21,7 @@ public sealed class VoiceController : IDisposable
     private AppSettings settings;
     private SpeechSettings policy = new(true, new HashSet<RegionKey>(), false, "4", 1);
     private VoiceStatus status;
-    private bool hasToken, synchronized, recoverCancellations, currentStarted, warningPrepared, storageHealthy = true;
+    private bool hasToken, synchronized, currentStarted, warningPrepared, storageHealthy = true;
     private HealthMessage? health;
     private long healthTick;
     private FeedState? state;
@@ -39,11 +39,14 @@ public sealed class VoiceController : IDisposable
         try
         {
             settings = LocalFiles.Read<AppSettings>("settings.json", 64 * 1024) ?? new();
+            if (settings.Environment != AppSettings.FeedEnvironment)
+                settings = settings with { Environment = AppSettings.FeedEnvironment, Muted = true, ForecastEnabled = false };
             if (!string.IsNullOrWhiteSpace(settings.FeedUrl))
                 settings.Validate();
             else
                 settings = new AppSettings { Muted = settings.Muted };
-            hasToken = CredentialVault.Read(settings.Scope) is not null;
+            var savedToken = CredentialVault.Read(settings.Scope);
+            hasToken = savedToken is not null && !IsRevoked(TokenScope(settings.Scope, savedToken));
         }
         catch (Exception ex) when (IsStorageError(ex) || ex is Win32Exception or ArgumentException)
         {
@@ -67,15 +70,18 @@ public sealed class VoiceController : IDisposable
         var token = replacementToken ?? CredentialVault.Read(scope);
         if (string.IsNullOrWhiteSpace(token) || token.Length > 2048 || token.Any(c => c < '!' || c > '~'))
             throw new ArgumentException("端末用の Bearer トークンを入力してください。");
+        var tokenScope = TokenScope(scope, token);
+        if (IsRevoked(tokenScope))
+            throw new ArgumentException("トークンは失効しています。新しいトークンを入力してください。");
         if (replacementToken is not null)
             CredentialVault.Write(scope, token);
 
         await DisconnectAsync().ConfigureAwait(false);
         selected = selected with { FeedUrl = endpoint.AbsoluteUri };
         LocalFiles.Write("settings.json", selected);
-        var cursorFile = $"feed-{AppSettings.Hash(scope + "\n" + token)}.json";
+        var cursorFile = $"feed-prc-{tokenScope}.json";
         var announcementFile = $"speech-{scope}.json";
-        var speaker = NewAudio(selected.AivisPort, selected.StyleId, Prefix(selected.Environment) + SpeechPolicy.FixedWarning);
+        var speaker = NewAudio(selected.AivisPort, selected.StyleId, SpeechPolicy.FixedWarning);
         lock (gate)
         {
             Dictionary<string, string>? readings = null;
@@ -112,7 +118,7 @@ public sealed class VoiceController : IDisposable
             var ct = connection.Token;
             SetStatus(status with { Connection = "接続中", Cursor = CursorText(state?.Cursor), Engine = "確認中",
                 Output = !storageHealthy ? "報知履歴エラー" : selected.Muted ? "ミュート" : "未確認" });
-            connectionTask = Task.Run(() => RunAsync(endpoint, token, selected.Environment, cursorFile, speaker, ct));
+            connectionTask = Task.Run(() => RunAsync(endpoint, token, tokenScope, cursorFile, speaker, ct));
         }
     }
 
@@ -208,12 +214,11 @@ public sealed class VoiceController : IDisposable
         }
     }
 
-    private async Task RunAsync(Uri endpoint, string token, string environment, string cursorFile, AudioOutput speaker,
+    private async Task RunAsync(Uri endpoint, string token, string tokenScope, string cursorFile, AudioOutput speaker,
         CancellationToken ct)
     {
         using var preparing = CancellationTokenSource.CreateLinkedTokenSource(ct);
         var preparation = PrepareAsync(speaker, preparing.Token);
-        var useCursor = true;
         var attempt = 0;
         try
         {
@@ -221,7 +226,7 @@ public sealed class VoiceController : IDisposable
             {
                 FeedState? prior;
                 lock (gate) prior = state;
-                var exit = await feed.RunAsync(endpoint, token, environment, prior, useCursor,
+                var exit = await feed.RunAsync(endpoint, token, AppSettings.FeedEnvironment, prior, useCursor: true,
                     () => { lock (gate) if (!ct.IsCancellationRequested) SetStatus(status with { Connection = "同期中" }); },
                     result => Receive(result, cursorFile, ct), ct).ConfigureAwait(false);
                 lock (gate)
@@ -231,21 +236,43 @@ public sealed class VoiceController : IDisposable
                     InvalidateFeed();
                     if (ct.IsCancellationRequested)
                         return;
+                    if (exit is FeedExit.Protocol or FeedExit.ResyncRequired)
+                    {
+                        state = null;
+                        try { LocalFiles.Write<FeedState?>(cursorFile, null); }
+                        catch (Exception ex) when (IsStorageError(ex)) { Log("古い再開位置をディスクから解除できませんでした。"); }
+                    }
+                    if (exit == FeedExit.TokenRevoked)
+                    {
+                        hasToken = false;
+                        try { LocalFiles.Write(RevocationFile(tokenScope), true); }
+                        catch (Exception ex) when (IsStorageError(ex)) { Log("トークンの失効状態を保存できませんでした。"); }
+                    }
                     var label = exit switch
                     {
+                        FeedExit.NormalClosure => "配信が正常に終了しました。",
+                        FeedExit.ServiceRestart => "配信サービスが停止しました。再接続します。",
                         FeedExit.Authentication => "認証が拒否されました。トークンを確認してください。",
-                        FeedExit.Incompatible => "配信側のスキーマ版に対応していません。",
+                        FeedExit.Incompatible => "購読要求またはスキーマ版が拒否されました。",
+                        FeedExit.ForbiddenEnvironment => "トークンが本番環境の購読を許可されていません。",
                         FeedExit.Protocol => "配信の順序または形式が不正です。全同期します。",
                         FeedExit.Timeout => "同期またはヘルス通知がタイムアウトしました。",
+                        FeedExit.ResyncRequired => "配信の世代または保持範囲が変わりました。全同期します。",
+                        FeedExit.TokenRevoked => "トークンが失効しました。新しいトークンを入力してください。",
+                        FeedExit.LimitExceeded => "配信がフレームまたは同期の上限を超えました。",
+                        FeedExit.SlowClient => "配信の送信がタイムアウトしました。再接続します。",
+                        FeedExit.RateLimited => "配信側の接続制限に達しました。1分待って再接続します。",
                         _ => "接続が切れました。"
                     };
                     Log(label);
-                    SetStatus(status with { Connection = label, Upstream = "未確認", Capture = "未確認", Clock = "未確認" });
-                    if (exit is FeedExit.Authentication or FeedExit.Incompatible)
+                    SetStatus(status with { Connection = label, Upstream = "未確認", Capture = "未確認",
+                        Clock = "未確認", Cursor = CursorText(state?.Cursor) });
+                    if (exit is FeedExit.NormalClosure or FeedExit.Authentication or FeedExit.Incompatible
+                        or FeedExit.ForbiddenEnvironment or FeedExit.TokenRevoked or FeedExit.LimitExceeded)
                         return;
                 }
-                useCursor = exit != FeedExit.Protocol;
-                var delay = Math.Min(30, 0.5 * Math.Pow(2, Math.Min(attempt++, 6)) * (1 + Random.Shared.NextDouble() * 0.2));
+                var delay = exit == FeedExit.RateLimited ? 60
+                    : Math.Min(30, 0.5 * Math.Pow(2, Math.Min(attempt++, 6)) * (1 + Random.Shared.NextDouble() * 0.2));
                 await Task.Delay(TimeSpan.FromSeconds(delay), ct).ConfigureAwait(false);
             }
         }
@@ -322,18 +349,8 @@ public sealed class VoiceController : IDisposable
             if (result.CompletedSync)
             {
                 synchronized = true;
-                recoverCancellations = true;
                 SetStatus(status with { Connection = "接続済み" });
                 Log($"無音同期完了　{state?.Events.Count ?? 0} 件　{status.Cursor}");
-            }
-            if (synchronized && recoverCancellations && CanConsiderSpeech() && state is { } currentState)
-            {
-                recoverCancellations = false;
-                foreach (var earthquake in currentState.Events.Values)
-                {
-                    Offer(SpeechPolicy.Cancellation(earthquake, SeriesKind.Warning, marks, FeedNow()));
-                    Offer(SpeechPolicy.Cancellation(earthquake, SeriesKind.Forecast, marks, FeedNow()));
-                }
             }
             if (result.LiveUpdate is { } live)
             {
@@ -423,7 +440,6 @@ public sealed class VoiceController : IDisposable
                     AudioOutput speaker;
                     CancellationTokenSource playback;
                     TaskCompletionSource completion;
-                    string prefix;
                     lock (gate)
                     {
                         if (audio is null || queue.MinBy(item => item.Kind) is not { } next)
@@ -438,9 +454,8 @@ public sealed class VoiceController : IDisposable
                         playing = playback = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
                         completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                         playCompletion = completion.Task;
-                        prefix = Prefix(settings.Environment);
                     }
-                    try { await PlayAsync(job, speaker, prefix, playback.Token).ConfigureAwait(false); }
+                    try { await PlayAsync(job, speaker, playback.Token).ConfigureAwait(false); }
                     finally
                     {
                         lock (gate)
@@ -458,7 +473,7 @@ public sealed class VoiceController : IDisposable
         catch (OperationCanceledException) when (lifetime.IsCancellationRequested) { }
     }
 
-    private async Task PlayAsync(SpeechJob job, AudioOutput speaker, string prefix, CancellationToken ct)
+    private async Task PlayAsync(SpeechJob job, AudioOutput speaker, CancellationToken ct)
     {
         var started = false;
         ValueTask<bool> Begin(CancellationToken cancellation)
@@ -527,23 +542,21 @@ public sealed class VoiceController : IDisposable
         {
             if (job.Kind == SpeechKind.FirstWarning)
             {
-                var prepared = await speaker.PlayPreparedAsync(prefix + SpeechPolicy.FixedWarning, Begin, ct).ConfigureAwait(false);
+                var prepared = await speaker.PlayPreparedAsync(SpeechPolicy.FixedWarning, Begin, ct).ConfigureAwait(false);
                 if (prepared)
                     await SpeakBeforeDeadline(job.Text, Continue, TimeSpan.FromMilliseconds(750)).ConfigureAwait(false);
-                else if (!started && prefix.Length == 0)
-                    await speaker.PlaySignalAsync(AudioSignal.Alert, Begin, ct).ConfigureAwait(false);
                 else if (!started)
-                    await SpeakBeforeDeadline(prefix + SpeechPolicy.FixedWarning + job.Text, Begin).ConfigureAwait(false);
+                    await speaker.PlaySignalAsync(AudioSignal.Alert, Begin, ct).ConfigureAwait(false);
             }
             else
             {
-                var canUseTone = job.IsWarning && prefix.Length == 0;
+                var canUseTone = job.IsWarning;
                 bool prepared;
                 lock (gate) prepared = warningPrepared;
                 try
                 {
                     if (!canUseTone || prepared)
-                        await SpeakBeforeDeadline(prefix + job.Text, Begin,
+                        await SpeakBeforeDeadline(job.Text, Begin,
                             canUseTone ? TimeSpan.FromSeconds(2) : null).ConfigureAwait(false);
                 }
                 catch (SpeechEngineException) when (canUseTone && !started)
@@ -601,7 +614,6 @@ public sealed class VoiceController : IDisposable
     private void InvalidateFeed()
     {
         synchronized = false;
-        recoverCancellations = false;
         health = null;
         StopAudioLocked();
     }
@@ -649,12 +661,9 @@ public sealed class VoiceController : IDisposable
         SpeechKind.ForecastCancel => "予報取消",
         _ => "予報"
     };
-    private static string Prefix(string environment) => environment switch
-    {
-        "training" => "訓練。これは訓練です。",
-        "test" => "試験。これは試験です。",
-        _ => ""
-    };
+    private static string TokenScope(string scope, string token) => AppSettings.Hash(scope + "\n" + token);
+    private static string RevocationFile(string tokenScope) => $"revoked-{tokenScope}.json";
+    private static bool IsRevoked(string tokenScope) => LocalFiles.Read<bool>(RevocationFile(tokenScope), 1024);
     private static HashSet<RegionKey> ReadRegions(string[] regions)
     {
         var keys = new HashSet<RegionKey>();

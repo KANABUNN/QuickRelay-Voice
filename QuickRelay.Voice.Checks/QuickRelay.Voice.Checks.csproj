@@ -9,5 +9,6 @@
   <ItemGroup>
     <FrameworkReference Include="Microsoft.AspNetCore.App" />
     <ProjectReference Include="../QuickRelay.Voice.Core/QuickRelay.Voice.Core.csproj" />
+    <None Update="ContractExamples/eew-*.valid.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
