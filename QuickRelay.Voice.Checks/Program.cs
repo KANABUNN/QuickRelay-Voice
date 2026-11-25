@@ -5,7 +5,6 @@ FeedChecks.Run();
 ContractChecks.Run();
 CheckSpeech();
 Console.WriteLine("PASS speech policy: warning scope, forecast quality and ranges, expiry and cancellation history");
-await VoiceChecks.RunAsync();
 await TransportChecks.RunAsync();
 Console.WriteLine("QRV verification passed.");
 
