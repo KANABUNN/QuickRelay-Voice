@@ -5,7 +5,7 @@ namespace QuickRelay.Voice.Core.Feed;
 
 public static partial class FeedProtocol
 {
-    private static WarningData ParseWarning(JsonElement data, JsonElement series, FeedSource current)
+    private static WarningData ParseWarning(JsonElement data, FeedSource current)
     {
         data = Object(data, "warning.data");
         var coverage = Text(data, "coverage") switch
@@ -14,13 +14,14 @@ public static partial class FeedProtocol
             "partial" => WarningCoverage.Partial,
             _ => throw Invalid("coverage")
         };
-        var regionSources = ParseRegionSources(series, current);
+        var regionSources = ParseRegionSources(data, current);
         var active = ParseWarningRegions(data, "activeRegions", requireProvenance: true);
         foreach (var region in active)
         {
             if (region.SourceRef is { } sourceRef)
             {
-                if (!regionSources.TryGetValue(sourceRef, out var source))
+                var source = sourceRef == current.TelegramId ? current : regionSources.GetValueOrDefault(sourceRef);
+                if (source is null)
                 {
                     throw Invalid("sourceRef");
                 }
@@ -40,7 +41,7 @@ public static partial class FeedProtocol
         foreach (var addition in additions)
         {
             if (!reportedKeys.Contains(addition.Key) || !activeByKey.TryGetValue(addition.Key, out var region) ||
-                region.SourceRef != current.TelegramId || !MatchesProvenance(addition, region))
+                region.SourceRef != current.TelegramId || addition.Level != region.Level)
             {
                 throw Invalid("addedRegions");
             }
@@ -49,7 +50,7 @@ public static partial class FeedProtocol
 
         foreach (var region in report)
         {
-            if (!activeByKey.TryGetValue(region.Key, out var activeRegion) || !MatchesProvenance(region, activeRegion))
+            if (!activeByKey.ContainsKey(region.Key))
             {
                 throw Invalid("reportRegions");
             }
@@ -59,43 +60,17 @@ public static partial class FeedProtocol
             new ReadOnlyDictionary<string, FeedSource>(regionSources));
     }
 
-    private static bool MatchesProvenance(WarningRegion given, WarningRegion original) =>
-        given.Level == original.Level && (given.SourceRef is null || given.SourceRef == original.SourceRef) &&
-        (given.SpeechUntil is null || given.SpeechUntil == original.SpeechUntil);
-
-    private static Dictionary<string, FeedSource> ParseRegionSources(JsonElement series, FeedSource current)
+    private static Dictionary<string, FeedSource> ParseRegionSources(JsonElement data, FeedSource current)
     {
-        var sources = new Dictionary<string, FeedSource>(StringComparer.Ordinal) { [current.TelegramId] = current };
-        if (Optional(series, "regionSources") is not { } value)
+        var sources = new Dictionary<string, FeedSource>(StringComparer.Ordinal);
+        foreach (var item in Array(Required(data, "regionSources"), "regionSources"))
         {
-            return sources;
-        }
-
-        if (value.ValueKind == JsonValueKind.Array)
-        {
-            foreach (var item in value.EnumerateArray())
-            {
-                var source = ParseSource(item, SeriesKind.Warning);
-                AddRegionSource(sources, source.TelegramId, source);
-            }
-        }
-        else
-        {
-            foreach (var item in Object(value, "regionSources").EnumerateObject())
-            {
-                AddRegionSource(sources, item.Name, ParseSource(item.Value, SeriesKind.Warning));
-            }
+            var source = ParseSource(item, SeriesKind.Warning);
+            if (source.TelegramId == current.TelegramId || source.InfoType == InfoType.Cancel
+                || !sources.TryAdd(source.TelegramId, source))
+                throw Invalid("regionSources");
         }
         return sources;
-    }
-
-    private static void AddRegionSource(Dictionary<string, FeedSource> sources, string key, FeedSource source)
-    {
-        if (key != source.TelegramId || source.InfoType == InfoType.Cancel ||
-            !sources.TryAdd(key, source) && sources[key] != source)
-        {
-            throw Invalid("regionSources");
-        }
     }
 
     private static IReadOnlyList<WarningRegion> ParseWarningRegions(JsonElement data, string name, bool requireProvenance)
@@ -111,14 +86,18 @@ public static partial class FeedProtocol
                 throw Invalid(name);
             }
 
+            var level = Text(value, "level");
+            if (level is not ("zone" or "prefecture" or "region"))
+                throw Invalid("level");
+            string? sourceRef = null;
+            DateTimeOffset? deadline = null;
             if (requireProvenance)
             {
-                _ = Required(value, "sourceRef");
-                _ = Required(value, "speechUntil");
+                var reference = Required(value, "sourceRef");
+                sourceRef = reference.ValueKind == JsonValueKind.Null ? null : StringValue(reference, "sourceRef");
+                deadline = ReadNullableTime(Required(value, "speechUntil"), "speechUntil");
             }
-            var sourceRef = OptionalText(value, "sourceRef");
-            var deadline = Optional(value, "speechUntil") is { } time ? ReadTime(time, "speechUntil") : (DateTimeOffset?)null;
-            regions.Add(new WarningRegion(key, Text(value, "name"), Text(value, "level"), sourceRef, deadline));
+            regions.Add(new WarningRegion(key, Label(value, "name"), level, sourceRef, deadline));
         }
         return regions.AsReadOnly();
     }
@@ -126,36 +105,40 @@ public static partial class FeedProtocol
     private static ForecastData ParseForecast(JsonElement data)
     {
         data = Object(data, "forecast.data");
-        var hypocenter = Optional(data, "hypocenter") is { } value ? ParseHypocenter(value) : null;
-        return new ForecastData(hypocenter, OptionalNumber(data, "magnitude"), OptionalNonnegativeInt(data, "depthKm"),
-            OptionalIntensity(data, "maxIntensity"), ParseRegionForecasts(data), OptionalIntensity(data, "maxLongPeriodClass", longPeriod: true));
+        var location = Required(data, "hypocenter");
+        var hypocenter = location.ValueKind == JsonValueKind.Null ? null : ParseHypocenter(location);
+        var originTime = ReadNullableTime(Required(data, "originTime"), "originTime");
+        var magnitude = ReadNullableNumber(data, "magnitude");
+        var depth = Required(data, "depthKm").ValueKind == JsonValueKind.Null ? (int?)null : NonnegativeInt(data, "depthKm");
+        if (hypocenter?.Quality == ForecastQuality.Assumed && (originTime is not null || magnitude is not null || depth is not null))
+            throw Invalid("assumed forecast data");
+        return new ForecastData(hypocenter, magnitude, depth, ParseIntensity(Required(data, "maxIntensity"), "maxIntensity"),
+            ParseRegionForecasts(data), ReadNullableIntensity(data, "maxLongPeriodClass"), originTime);
     }
 
     private static ForecastHypocenter ParseHypocenter(JsonElement value)
     {
         var obj = Object(value, "hypocenter");
-        var quality = OptionalText(obj, "quality") switch
+        var quality = Object(Required(obj, "quality"), "quality");
+        var kind = Text(quality, "kind") switch
         {
             "estimated" => ForecastQuality.Estimated,
             "assumed" => ForecastQuality.Assumed,
-            "low_accuracy" => ForecastQuality.LowAccuracy,
-            "unknown" or null => ForecastQuality.Unknown,
+            "lowAccuracy" => ForecastQuality.LowAccuracy,
             _ => throw Invalid("hypocenter.quality")
         };
-        return new ForecastHypocenter(OptionalText(obj, "code"), OptionalText(obj, "name"), quality,
-            OptionalNonnegativeInt(obj, "observationPoints"));
+        var points = quality.TryGetProperty("magnitudePoints", out _) ? NonnegativeInt(quality, "magnitudePoints") : (int?)null;
+        return new ForecastHypocenter(Label(obj, "code"), Label(obj, "name"), kind, points,
+            ReadNullableNumber(obj, "latitude"), ReadNullableNumber(obj, "longitude"),
+            OptionalLabel(quality, "epicenterRank"), OptionalLabel(quality, "epicenterRank2"),
+            OptionalLabel(quality, "depthRank"), OptionalLabel(quality, "magnitudeRank"));
     }
 
     private static IReadOnlyList<RegionForecast> ParseRegionForecasts(JsonElement data)
     {
-        if (Optional(data, "regionForecasts") is not { } entries)
-        {
-            return [];
-        }
-
         var keys = new HashSet<RegionKey>();
         var regions = new List<RegionForecast>();
-        foreach (var item in Array(entries, "regionForecasts"))
+        foreach (var item in Array(Required(data, "regionForecasts"), "regionForecasts"))
         {
             var obj = Object(item, "regionForecasts");
             var key = ParseRegionKey(obj);
@@ -164,35 +147,52 @@ public static partial class FeedProtocol
                 throw Invalid("regionForecasts");
             }
 
-            regions.Add(new RegionForecast(key, Text(obj, "name"), Text(obj, "level"), OptionalIntensity(obj, "intensity"),
-                Optional(obj, "arrivalTime") is { } time ? ReadTime(time, "arrivalTime") : null,
-                OptionalText(obj, "arrivalCondition")));
+            var arrival = Object(Required(obj, "arrival"), "arrival");
+            var condition = Text(arrival, "condition") switch
+            {
+                "predicted" => ArrivalCondition.Predicted,
+                "arrived" => ArrivalCondition.Arrived,
+                "noPrediction" => ArrivalCondition.NoPrediction,
+                "unknown" => ArrivalCondition.Unknown,
+                _ => throw Invalid("arrival.condition")
+            };
+            var time = ReadNullableTime(Required(arrival, "time"), "arrival.time");
+            var warning = Required(obj, "isWarning").ValueKind switch
+            {
+                JsonValueKind.True => true,
+                JsonValueKind.False => false,
+                _ => throw Invalid("isWarning")
+            };
+            regions.Add(new RegionForecast(key, Label(obj, "name"), ParseIntensity(Required(obj, "maxIntensity"), "maxIntensity"),
+                time, condition, ReadNullableIntensity(obj, "maxLongPeriodClass"), OptionalLabel(arrival, "text"),
+                OptionalLabel(obj, "prefectureCode"), OptionalLabel(obj, "prefectureName"), OptionalLabel(obj, "kindCode"),
+                OptionalLabel(obj, "kindName"), warning));
         }
         return regions.AsReadOnly();
     }
 
     private static RegionKey ParseRegionKey(JsonElement value) => new(Text(value, "codeType"), Text(value, "code"));
 
-    private static double? OptionalNumber(JsonElement obj, string key)
+    private static double? ReadNullableNumber(JsonElement obj, string key)
     {
-        if (Optional(obj, key) is not { } value)
-        {
+        var value = Required(obj, key);
+        if (value.ValueKind == JsonValueKind.Null)
             return null;
-        }
         return value.ValueKind == JsonValueKind.Number && value.TryGetDouble(out double result) && double.IsFinite(result)
             ? result : throw Invalid(key);
     }
 
-    private static int? OptionalNonnegativeInt(JsonElement obj, string key) => Optional(obj, key) is null
-        ? null : Integer(obj, key) is >= 0 and var value ? value : throw Invalid(key);
+    private static int NonnegativeInt(JsonElement obj, string key)
+        => Integer(obj, key) is >= 0 and var value ? value : throw Invalid(key);
 
-    private static IntensityRange? OptionalIntensity(JsonElement data, string key, bool longPeriod = false)
+    private static IntensityRange? ReadNullableIntensity(JsonElement data, string key)
     {
-        if (Optional(data, key) is not { } value)
-        {
-            return null;
-        }
+        var value = Required(data, key);
+        return value.ValueKind == JsonValueKind.Null ? null : ParseIntensity(value, key, longPeriod: true);
+    }
 
+    private static IntensityRange ParseIntensity(JsonElement value, string key, bool longPeriod = false)
+    {
         var obj = Object(value, key);
         var kind = Text(obj, "kind");
         var exact = OptionalText(obj, "value");

@@ -20,8 +20,7 @@ public sealed class FeedReducer
     private ImmutableDictionary<string, FeedEvent> stagedEvents = ImmutableDictionary<string, FeedEvent>.Empty;
     private ulong stagedSeq;
     private int? partCount;
-    private int? firstPart;
-    private long nextPart;
+    private long nextPart = 1;
 
     public FeedReducer(string environment, FeedState? lastState = null)
     {
@@ -54,7 +53,6 @@ public sealed class FeedReducer
         StateMessage update => Update(update),
         SnapshotMessage part => AddSnapshot(part),
         SyncComplete finish => Complete(finish),
-        ErrorMessage => throw new FeedProtocolException("The server rejected the EEW subscription."),
         _ => throw new FeedProtocolException("Unexpected EEW message.")
     };
 
@@ -125,23 +123,14 @@ public sealed class FeedReducer
     private FeedApplyResult AddSnapshot(SnapshotMessage message)
     {
         if (boundary is not { Mode: SyncMode.Snapshot } snapshot || message.AsOfSeq != snapshot.AsOfSeq ||
-            message.StreamId is not null && message.StreamId != snapshot.StreamId ||
-            message.Epoch is not null && message.Epoch != snapshot.Epoch || message.Parts <= 0)
+            message.StreamId != snapshot.StreamId || message.Epoch != snapshot.Epoch ||
+            message.Parts <= 0 || message.Part > message.Parts)
         {
             throw new FeedProtocolException("Unexpected EEW snapshot boundary.");
         }
 
-        if (partCount is null)
-        {
-            if (message.Part is not (0 or 1))
-            {
-                throw new FeedProtocolException("Invalid first EEW snapshot part.");
-            }
-            nextPart = message.Part;
-            firstPart = message.Part;
-            partCount = message.Parts;
-        }
-        if (message.Parts != partCount || message.Part != nextPart || message.Part - firstPart >= partCount)
+        partCount ??= message.Parts;
+        if (message.Parts != partCount || message.Part != nextPart)
         {
             throw new FeedProtocolException("EEW snapshot part sequence is incomplete or inconsistent.");
         }
@@ -171,7 +160,7 @@ public sealed class FeedReducer
     {
         if (boundary is not { } start || !Matches(message.Cursor, start.StreamId, start.Epoch) ||
             message.Cursor.Seq != start.AsOfSeq ||
-            (start.Mode == SyncMode.Resume ? stagedSeq != start.AsOfSeq : firstPart is null || nextPart - firstPart != partCount))
+            (start.Mode == SyncMode.Resume ? stagedSeq != start.AsOfSeq : nextPart - 1 != partCount))
         {
             throw new FeedProtocolException("EEW synchronization ended before its boundary was complete.");
         }
@@ -226,16 +215,21 @@ public sealed class FeedReducer
 
     private static DateTimeOffset LatestReceivedAt(FeedEvent value)
     {
-        var forecast = value.Forecast?.Source.ReceivedAt ?? DateTimeOffset.MinValue;
-        var warning = value.Warning?.Source.ReceivedAt ?? DateTimeOffset.MinValue;
+        var forecast = ReportTime(value.Forecast?.Source);
+        var warning = ReportTime(value.Warning?.Source);
         return forecast > warning ? forecast : warning;
     }
 
+    private static DateTimeOffset ReportTime(FeedSource? source) =>
+        source?.ReceivedAt ?? source?.IssuedAt ?? source?.ControlAt ?? DateTimeOffset.MinValue;
+
     private static void RequireSnapshotProgress(FeedEvent previous, FeedEvent incoming)
     {
-        if (incoming.Revision < previous.Revision)
+        if (incoming.Revision < previous.Revision ||
+            incoming.Revision == previous.Revision &&
+            (!SeriesEqual(previous.Forecast, incoming.Forecast) || !SeriesEqual(previous.Warning, incoming.Warning)))
         {
-            throw new FeedProtocolException("EEW snapshot event revision moved backward.");
+            throw new FeedProtocolException("EEW snapshot event conflicts with the saved revision.");
         }
         RequireSnapshotSeriesProgress(previous.Forecast, incoming.Forecast);
         RequireSnapshotSeriesProgress(previous.Warning, incoming.Warning);
@@ -243,9 +237,13 @@ public sealed class FeedReducer
 
     private static void RequireSnapshotSeriesProgress(FeedSeries? previous, FeedSeries? incoming)
     {
-        if (previous is null || incoming is null)
+        if (previous is null)
         {
             return;
+        }
+        if (incoming is null)
+        {
+            throw new FeedProtocolException("EEW snapshot lost a series from the saved event.");
         }
         if (incoming.Revision == previous.Revision && SeriesEqual(previous, incoming))
         {
@@ -299,7 +297,7 @@ public sealed class FeedReducer
         }
         return first.Hypocenter == second.Hypocenter && first.Magnitude == second.Magnitude && first.DepthKm == second.DepthKm &&
             first.MaxIntensity == second.MaxIntensity && first.MaxLongPeriodClass == second.MaxLongPeriodClass &&
-            first.RegionForecasts.ToHashSet().SetEquals(second.RegionForecasts);
+            first.OriginTime == second.OriginTime && first.RegionForecasts.ToHashSet().SetEquals(second.RegionForecasts);
     }
 
     private static bool WarningsEqual(WarningData? first, WarningData? second)

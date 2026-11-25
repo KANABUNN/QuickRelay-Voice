@@ -7,10 +7,6 @@ public sealed class MainForm : Form
     private static readonly Color Aqua = Color.FromArgb(148, 234, 223);
     private static readonly Color Cloud = Color.FromArgb(237, 242, 246);
     private static readonly Color Ink = Color.FromArgb(23, 40, 55);
-    private static readonly (string Text, string Value)[] Environments =
-    [
-        ("本番 (production)", "production"), ("訓練 (training)", "training"), ("試験 (test)", "test")
-    ];
     private static readonly (string Text, string Value)[] Thresholds =
     [
         ("震度0", "0"), ("震度1", "1"), ("震度2", "2"), ("震度3", "3"), ("震度4", "4"),
@@ -21,7 +17,6 @@ public sealed class MainForm : Form
     private readonly VoiceController controller;
     private readonly TextBox feedUrl = new() { AccessibleName = "WSS 接続先", PlaceholderText = "wss://サーバー名/v1/eew" };
     private readonly TextBox token = new() { AccessibleName = "接続トークン", UseSystemPasswordChar = true };
-    private readonly ComboBox environment = new() { AccessibleName = "配信環境", DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly CheckBox muted = new() { Text = "消音で受信", AccessibleName = "消音で受信", AutoSize = true };
     private readonly CheckBox nationwide = new() { Text = "全国の警報を対象にする", AutoSize = true };
     private readonly TextBox regions = new()
@@ -75,7 +70,6 @@ public sealed class MainForm : Form
         forecast.CheckedChanged += (_, _) => UpdateOptions();
         muted.CheckedChanged += (_, _) => controller.Mute(muted.Checked);
         feedUrl.TextChanged += (_, _) => UpdateTokenHint();
-        environment.SelectedIndexChanged += (_, _) => UpdateTokenHint();
         connect.Click += async (_, _) => await ConnectAsync();
         disconnect.Click += async (_, _) => await RunConnectionActionAsync(controller.DisconnectAsync, "切断しました。");
         stop.Click += (_, _) => controller.StopAudio();
@@ -203,7 +197,7 @@ public sealed class MainForm : Form
         AddSetting(grid, "WSS 接続先", feedUrl);
         AddSetting(grid, "トークン", token);
         AddSetting(grid, string.Empty, tokenHint);
-        AddSetting(grid, "配信環境", environment);
+        AddSetting(grid, "配信環境", new Label { Text = "本番 (production)", AutoSize = true });
         AddWideRow(grid, ButtonRow(connect, disconnect));
 
         AddWideRow(grid, SectionTitle("読み上げ範囲"));
@@ -225,9 +219,6 @@ public sealed class MainForm : Form
     private void LoadSettings(AppSettings settings)
     {
         feedUrl.Text = settings.FeedUrl;
-        environment.Items.AddRange(Environments.Select(value => value.Text).ToArray());
-        var selectedEnvironment = Array.FindIndex(Environments, value => value.Value == settings.Environment);
-        environment.SelectedIndex = selectedEnvironment >= 0 ? selectedEnvironment : 0;
         muted.Checked = settings.Muted;
         nationwide.Checked = settings.Nationwide;
         regions.Lines = settings.Regions;
@@ -275,7 +266,7 @@ public sealed class MainForm : Form
 
         var settings = new AppSettings
         {
-            FeedUrl = feedUrl.Text.Trim(), Environment = Environments[environment.SelectedIndex].Value, Muted = muted.Checked,
+            FeedUrl = feedUrl.Text.Trim(), Muted = muted.Checked,
             Nationwide = nationwide.Checked, Regions = regionKeys, ForecastEnabled = forecast.Checked,
             ForecastThreshold = Thresholds[threshold.SelectedIndex].Value, ForecastStep = (int)step.Value,
             AivisPort = (int)port.Value, StyleId = styleId
@@ -312,7 +303,7 @@ public sealed class MainForm : Form
 
     private string CurrentScope() => new AppSettings
     {
-        FeedUrl = feedUrl.Text.Trim(), Environment = Environments[environment.SelectedIndex].Value
+        FeedUrl = feedUrl.Text.Trim()
     }.Scope;
 
     private async Task RunConnectionActionAsync(Func<Task> action, string success)
@@ -328,6 +319,10 @@ public sealed class MainForm : Form
         {
             await action();
             actionHint.Text = success;
+        }
+        catch (ArgumentException exception)
+        {
+            actionHint.Text = exception.Message;
         }
         catch (Exception)
         {
@@ -419,6 +414,7 @@ public sealed class MainForm : Form
         if (!IsDisposed)
         {
             RenderStatus(status);
+            UpdateTokenHint();
         }
     }, null);
 
@@ -429,7 +425,7 @@ public sealed class MainForm : Form
             return;
         }
 
-        activity.Items.Insert(0, $"{DateTime.Now:HH:mm:ss}  {entry}");
+        activity.Items.Insert(0, entry);
         if (activity.Items.Count > 200)
         {
             activity.Items.RemoveAt(200);

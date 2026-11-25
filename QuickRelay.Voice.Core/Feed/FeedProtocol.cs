@@ -66,13 +66,10 @@ public static partial class FeedProtocol
                     },
                     Decimal(root, "asOfSeq")),
                 "eew.state" => ParseState(root),
-                "snapshot" => new SnapshotMessage(
-                    Decimal(root, "asOfSeq"), Integer(root, "part"), Integer(root, "parts"),
-                    ParseEvents(Required(root, "events")), OptionalText(root, "streamId"), OptionalText(root, "epoch")),
+                "snapshot" => ParseSnapshot(root),
                 "sync_complete" => new SyncComplete(ParseCursor(Required(root, "cursor"))),
                 "health" => new HealthMessage(
                     ReadTime(Required(root, "serverTime"), "serverTime"), ParseHealth(root, "upstream"), ParseHealth(root, "capture")),
-                "error" => new ErrorMessage(Text(root, "code")),
                 _ => throw Invalid("type")
             };
         }
@@ -88,6 +85,16 @@ public static partial class FeedProtocol
         {
             throw new FeedProtocolException("Invalid EEW JSON value.", ex);
         }
+    }
+
+    private static SnapshotMessage ParseSnapshot(JsonElement root)
+    {
+        var part = Integer(root, "part");
+        var parts = Integer(root, "parts");
+        if (part < 1 || part > parts)
+            throw Invalid("part");
+        return new SnapshotMessage(Decimal(root, "asOfSeq"), part, parts, ParseEvents(Required(root, "events")),
+            Text(root, "streamId"), Text(root, "epoch"));
     }
 
     private static StateMessage ParseState(JsonElement root)
@@ -180,7 +187,7 @@ public static partial class FeedProtocol
 
         return new FeedSeries(status, PositiveDecimal(obj, "revision"), source,
             status != SeriesStatus.Canceled && kind == SeriesKind.Forecast ? ParseForecast(data) : null,
-            status != SeriesStatus.Canceled && kind == SeriesKind.Warning ? ParseWarning(data, obj, source) : null,
+            status != SeriesStatus.Canceled && kind == SeriesKind.Warning ? ParseWarning(data, source) : null,
             speechUntil);
     }
 
@@ -200,7 +207,12 @@ public static partial class FeedProtocol
             ParseDecimal(serial, "serial");
         }
 
-        return new FeedSource(Text(source, "issuer"), Text(source, "provider"), code, Text(source, "telegramId"), serial,
+        var issuer = Text(source, "issuer");
+        var provider = Text(source, "provider");
+        if (issuer != "JMA" || provider != "DMDATA")
+            throw Invalid("source.issuer/provider");
+
+        return new FeedSource(issuer, provider, code, Text(source, "telegramId"), serial,
             Text(source, "infoType") switch
             {
                 "issue" => InfoType.Issue,
@@ -210,7 +222,7 @@ public static partial class FeedProtocol
             },
             ReadNullableTime(Required(source, "issuedAt"), "issuedAt"),
             ReadNullableTime(Required(source, "sentAt"), "sentAt"),
-            ReadTime(Required(source, "receivedAt"), "receivedAt"),
+            ReadNullableTime(Required(source, "receivedAt"), "receivedAt"),
             ReadNullableTime(Required(source, "controlAt"), "controlAt"),
             Text(source, "origin") switch
             {
@@ -277,18 +289,20 @@ public static partial class FeedProtocol
     private static JsonElement Required(JsonElement value, string key) =>
         value.TryGetProperty(key, out var property) ? property : throw Invalid(key);
 
-    private static JsonElement? Optional(JsonElement value, string key) =>
-        value.TryGetProperty(key, out var property) && property.ValueKind != JsonValueKind.Null ? property : null;
-
     private static string Text(JsonElement value, string key) => StringValue(Required(value, key), key);
 
-    private static string? OptionalText(JsonElement value, string key) =>
-        Optional(value, key) is { } property ? StringValue(property, key) : null;
+    private static string Label(JsonElement value, string key) => StringValue(Required(value, key), key, allowEmpty: true);
 
-    private static string StringValue(JsonElement value, string key)
+    private static string? OptionalLabel(JsonElement value, string key) =>
+        value.TryGetProperty(key, out var property) ? StringValue(property, key, allowEmpty: true) : null;
+
+    private static string? OptionalText(JsonElement value, string key) =>
+        value.TryGetProperty(key, out var property) ? StringValue(property, key) : null;
+
+    private static string StringValue(JsonElement value, string key, bool allowEmpty = false)
     {
         if (value.ValueKind != JsonValueKind.String || value.GetString() is not { } text ||
-            string.IsNullOrWhiteSpace(text) || text.Any(char.IsControl))
+            (!allowEmpty && string.IsNullOrWhiteSpace(text)) || text.Any(char.IsControl))
         {
             throw Invalid(key);
         }
@@ -310,7 +324,9 @@ public static partial class FeedProtocol
     private static ulong Decimal(JsonElement obj, string key) => ParseDecimal(Text(obj, key), key);
 
     private static ulong ParseDecimal(string value, string key) =>
-        ulong.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out ulong parsed) ? parsed : throw Invalid(key);
+        value.Length > 0 && (value.Length == 1 || value[0] != '0')
+        && ulong.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, out ulong parsed)
+            ? parsed : throw Invalid(key);
 
     private static DateTimeOffset? ReadNullableTime(JsonElement value, string key) =>
         value.ValueKind == JsonValueKind.Null ? null : ReadTime(value, key);

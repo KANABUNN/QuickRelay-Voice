@@ -11,6 +11,7 @@ public enum SyncMode { Resume, Snapshot }
 public enum WarningCoverage { Complete, Partial }
 public enum ForecastQuality { Unknown, Estimated, Assumed, LowAccuracy }
 public enum IntensityKind { Unknown, Exact, Range, LowerBound }
+public enum ArrivalCondition { Unknown, Predicted, Arrived, NoPrediction }
 
 public sealed record FeedCursor(string StreamId, string Epoch, ulong Seq);
 
@@ -33,15 +34,13 @@ public sealed record SnapshotMessage(
     int Part,
     int Parts,
     IReadOnlyList<FeedEvent> Events,
-    string? StreamId = null,
-    string? Epoch = null) : FeedMessage;
+    string StreamId,
+    string Epoch) : FeedMessage;
 
 public sealed record SyncComplete(FeedCursor Cursor) : FeedMessage;
 
 public sealed record HealthMessage(
     DateTimeOffset ServerTime, HealthStatus Upstream, HealthStatus Capture) : FeedMessage;
-
-public sealed record ErrorMessage(string Code) : FeedMessage;
 
 public sealed record FeedEvent(
     string EventId, string Environment, ulong Revision, FeedSeries? Forecast, FeedSeries? Warning)
@@ -66,7 +65,7 @@ public sealed record FeedSource(
     InfoType InfoType,
     DateTimeOffset? IssuedAt,
     DateTimeOffset? SentAt,
-    DateTimeOffset ReceivedAt,
+    DateTimeOffset? ReceivedAt,
     DateTimeOffset? ControlAt,
     SourceOrigin Origin);
 
@@ -82,27 +81,44 @@ public sealed record WarningData(
     IReadOnlyList<WarningRegion> ActiveRegions,
     IReadOnlyDictionary<string, FeedSource>? RegionSources = null);
 
-public sealed record ForecastHypocenter(string? Code, string? Name, ForecastQuality Quality, int? ObservationPoints);
+public sealed record ForecastHypocenter(
+    string? Code,
+    string? Name,
+    ForecastQuality Quality,
+    int? MagnitudePoints,
+    double? Latitude = null,
+    double? Longitude = null,
+    string? EpicenterRank = null,
+    string? EpicenterRank2 = null,
+    string? DepthRank = null,
+    string? MagnitudeRank = null);
 
 public sealed record IntensityRange(IntensityKind Kind, string? Value = null, string? Min = null, string? Max = null);
 
 public sealed record RegionForecast(
     RegionKey Key,
     string Name,
-    string Level,
-    IntensityRange? Intensity,
+    IntensityRange Intensity,
     DateTimeOffset? ArrivalTime,
-    string? ArrivalCondition);
+    ArrivalCondition ArrivalCondition,
+    IntensityRange? MaxLongPeriodClass = null,
+    string? ArrivalText = null,
+    string? PrefectureCode = null,
+    string? PrefectureName = null,
+    string? KindCode = null,
+    string? KindName = null,
+    bool IsWarning = false);
 
 public sealed record ForecastData(
     ForecastHypocenter? Hypocenter,
     double? Magnitude,
     int? DepthKm,
-    IntensityRange? MaxIntensity,
+    IntensityRange MaxIntensity,
     IReadOnlyList<RegionForecast> RegionForecasts,
-    IntensityRange? MaxLongPeriodClass)
+    IntensityRange? MaxLongPeriodClass,
+    DateTimeOffset? OriginTime = null)
 {
-    public bool HasReliableQuality => Hypocenter is { Quality: ForecastQuality.Estimated, ObservationPoints: >= 2 };
+    public bool HasReliableQuality => Hypocenter is { Quality: ForecastQuality.Estimated, MagnitudePoints: >= 2 };
 }
 
 public sealed class FeedProtocolException(string message, Exception? innerException = null)

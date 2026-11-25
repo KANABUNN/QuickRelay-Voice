@@ -2,6 +2,7 @@ using QuickRelay.Voice.Core;
 using QuickRelay.Voice.Core.Feed;
 
 FeedChecks.Run();
+ContractChecks.Run();
 CheckSpeech();
 Console.WriteLine("PASS speech policy: warning scope, forecast quality and ranges, expiry and cancellation history");
 await TransportChecks.RunAsync();
@@ -42,6 +43,13 @@ static void CheckSpeech()
     var mark = alert.Mark(now);
     var cancel = SpeechPolicy.Cancellation(voidWarning, SeriesKind.Warning, [mark], now);
     Check(cancel is { Kind: SpeechKind.WarningCancel }, "warning cancel after a started warning");
+    Check(SpeechPolicy.FromLive(Update(voidWarning, SeriesKind.Warning), settings, [mark], now)
+        is { Kind: SpeechKind.WarningCancel }, "live explicit cancellation can start after speaking its series");
+    Check(SpeechPolicy.FromLive(Update(voidWarning, SeriesKind.Warning) with { Delivery = DeliveryKind.Replay },
+        settings, [mark], now) is null, "a replayed cancellation stays silent even when the series previously played");
+    var recovered = voidWarning with { Warning = canceled with { Source = canceled.Source with { Origin = SourceOrigin.Recovered } } };
+    Check(SpeechPolicy.FromLive(Update(recovered, SeriesKind.Warning), settings, [mark], now)
+        is null, "a cancellation from recovered source stays silent on live delivery");
     Check(!SpeechPolicy.CanStart(alert, voidWarning, [mark], now), "canceled warning cannot start");
     Check(SpeechPolicy.Cancellation(voidWarning, SeriesKind.Warning, [], now) is null, "silent cancellation stays silent");
     Check(SpeechPolicy.Cancellation(voidWarning, SeriesKind.Warning, [mark, cancel!.Mark(now)], now) is null,
@@ -51,7 +59,7 @@ static void CheckSpeech()
 
     var range = new IntensityRange(IntensityKind.Range, Min: "5-", Max: "5+");
     var forecastData = new ForecastData(new(null, null, ForecastQuality.Estimated, 2), null, null,
-        new(IntensityKind.Exact, "7"), [new(selected, "例示地域", "region", range, null, null)], null);
+        new(IntensityKind.Exact, "7"), [new(selected, "例示地域", range, null, ArrivalCondition.Unknown)], null);
     var forecast = new FeedSeries(SeriesStatus.Active, 1, Source("VXSE45", "f1"), forecastData, null, now.AddSeconds(9));
     var eew = new FeedEvent("example", "test", 1, forecast, null);
     var estimate = SpeechPolicy.FromLive(Update(eew, SeriesKind.Forecast), settings, [], now);

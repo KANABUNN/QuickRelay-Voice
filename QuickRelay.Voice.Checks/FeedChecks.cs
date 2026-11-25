@@ -24,6 +24,7 @@ internal static class FeedChecks
         Reject(() => Parse(StateJson.Replace("\"schemaVersion\":1", "\"schemaVersion\":2")));
         Reject(() => Parse(StateJson.Replace("\"schemaVersion\":1", "\"schemaVersion\":1,\"schemaVersion\":1")));
         Reject(() => Parse(StateJson.Replace("\"9007199254740993\"", "9007199254740993")));
+        Reject(() => Parse(StateJson.Replace("\"9007199254740993\"", "\"09007199254740993\"")));
         Reject(() => Parse(StateJson.Replace("\"warning-1\",\"speechUntil\"", "\"missing\",\"speechUntil\"")));
         Reject(() => Parse(StateJson.Replace("T00:00:15Z", "T00:00:16Z")));
         Reject(() => Parse(StateJson.Replace("T00:00:15Z", "T00:00:15+09:00")));
@@ -37,10 +38,12 @@ internal static class FeedChecks
         var warning = ((StateMessage)Parse(StateJson)).Event;
         var reducer = new FeedReducer("production");
         reducer.Apply(new SyncBegin("eew", "g1", SyncMode.Snapshot, 12));
-        reducer.Apply(new SnapshotMessage(12, 0, 2, [warning]));
+        Reject(() => reducer.Apply(new SnapshotMessage(12, 0, 2, [warning], "eew", "g1")));
+        Reject(() => reducer.Apply(new SnapshotMessage(12, 1, 2, [warning], "eew", "replaced")));
+        reducer.Apply(new SnapshotMessage(12, 1, 2, [warning], "eew", "g1"));
         Check(reducer.State.Cursor is null && reducer.State.Events.Count == 0, "partial snapshot stays staged");
         Reject(() => reducer.Apply(new SyncComplete(new FeedCursor("eew", "g1", 12))));
-        reducer.Apply(new SnapshotMessage(12, 1, 2, []));
+        reducer.Apply(new SnapshotMessage(12, 2, 2, [], "eew", "g1"));
         var complete = reducer.Apply(new SyncComplete(new FeedCursor("eew", "g1", 12)));
         Check(complete.CompletedSync && complete.CommittedState?.Events.Count == 1, "multipart snapshot committed once");
 
@@ -63,7 +66,7 @@ internal static class FeedChecks
         var wrongBoundary = new FeedReducer("production", complete.CommittedState);
         Reject(() => wrongBoundary.Apply(new SyncBegin("eew", "g2", SyncMode.Resume, 13)));
         wrongBoundary.Apply(new SyncBegin("eew", "g2", SyncMode.Snapshot, 0));
-        wrongBoundary.Apply(new SnapshotMessage(0, 1, 1, []));
+        wrongBoundary.Apply(new SnapshotMessage(0, 1, 1, [], "eew", "g2"));
         var reset = wrongBoundary.Apply(new SyncComplete(new FeedCursor("eew", "g2", 0)));
         Check(reset.CommittedState is { Events.Count: 0, Cursor.Epoch: "g2" }, "a new epoch replaces prior state");
     }
@@ -73,11 +76,11 @@ internal static class FeedChecks
         var warning = ((StateMessage)Parse(StateJson)).Event;
         var reducer = new FeedReducer("production");
         reducer.Apply(new SyncBegin("eew", "g1", SyncMode.Snapshot, 1));
-        reducer.Apply(new SnapshotMessage(1, 1, 1, [warning]));
+        reducer.Apply(new SnapshotMessage(1, 1, 1, [warning], "eew", "g1"));
         reducer.Apply(new SyncComplete(new FeedCursor("eew", "g1", 1)));
 
         var forecast = new FeedSeries(SeriesStatus.Final, 1, warning.Warning!.Source with { Code = "VXSE45", TelegramId = "forecast-final", Serial = "9" },
-            new ForecastData(null, null, null, null, [], null), null, null);
+            new ForecastData(null, null, null, new(IntensityKind.Unknown), [], null), null, null);
         var both = warning with { Revision = 2, Forecast = forecast };
         reducer.Apply(Update(2, both, SeriesKind.Forecast));
         var afterCancel = both with { Revision = 3, Forecast = Canceled(forecast, "forecast-cancel") };
@@ -133,6 +136,7 @@ internal static class FeedChecks
           "source":{"issuer":"JMA","provider":"DMDATA","code":"VXSE43","telegramId":"warning-1","serial":"2","infoType":"issue",
                     "issuedAt":"2026-11-25T00:00:00Z","sentAt":null,"receivedAt":"2026-11-25T00:00:00Z","controlAt":null,"origin":"live"},
           "data":{"coverage":"partial",
+                  "regionSources":[],
                   "reportRegions":[{"codeType":"forecast-area","code":"001","name":"例示地域","level":"region"}],
                   "addedRegions":[{"codeType":"forecast-area","code":"001","name":"例示地域","level":"region"}],
                   "activeRegions":[{"codeType":"forecast-area","code":"001","name":"例示地域","level":"region","sourceRef":"warning-1","speechUntil":"2026-11-25T00:00:15Z"},
