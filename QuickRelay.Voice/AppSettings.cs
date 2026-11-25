@@ -16,6 +16,13 @@ public sealed record AppSettings
     public int ForecastStep { get; init; } = 1;
     public int AivisPort { get; init; } = 10101;
     public int? StyleId { get; init; }
+    public string? SpeakerUuid { get; init; }
+    public string? SpeakerName { get; init; }
+    public string? StyleName { get; init; }
+    public VoiceTuning Tuning { get; init; } = new();
+    public bool MinimizeToTray { get; init; } = true;
+    public bool StartInTray { get; init; }
+    public bool AutoConnect { get; init; }
 
     internal Uri Validate()
     {
@@ -32,9 +39,34 @@ public sealed record AppSettings
         if (ForecastThreshold is not ("0" or "1" or "2" or "3" or "4" or "5-" or "5+" or "6-" or "6+" or "7")
             || ForecastStep is < 1 or > 9)
             throw new ArgumentException("予報の震度しきい値と続報の差分を確認してください。");
-        ValidateAudio(AivisPort);
+        ValidateVoice();
         return uri;
     }
+
+    internal void ValidateVoice()
+    {
+        ValidateAudio(AivisPort);
+        if (SpeakerUuid is { Length: > 64 } || SpeakerName is { Length: > 200 } || StyleName is { Length: > 200 })
+            throw new ArgumentException("AivisSpeech のモデルとスタイルを一覧から選び直してください。");
+        if (Tuning is null || !Tuning.IsValid)
+            throw new ArgumentException("AivisSpeech の音声パラメーターが範囲外です。");
+    }
+
+    /// <summary>Repairs values that a hand-edited or older settings file can leave missing.</summary>
+    internal AppSettings Normalize() => Tuning is { IsValid: true } ? this : this with { Tuning = new() };
+
+    /// <summary>Copies the AivisSpeech choices without touching the feed settings.</summary>
+    internal AppSettings WithVoiceFrom(AppSettings source) => this with
+    {
+        AivisPort = source.AivisPort, StyleId = source.StyleId, SpeakerUuid = source.SpeakerUuid,
+        SpeakerName = source.SpeakerName, StyleName = source.StyleName, Tuning = source.Tuning
+    };
+
+    /// <summary>Copies the window and startup choices without touching the feed settings.</summary>
+    internal AppSettings WithResidencyFrom(AppSettings source) => this with
+    {
+        MinimizeToTray = source.MinimizeToTray, StartInTray = source.StartInTray, AutoConnect = source.AutoConnect
+    };
 
     internal string Scope => Uri.TryCreate(FeedUrl?.Trim(), UriKind.Absolute, out var uri)
         ? Hash(uri.AbsoluteUri + "\n" + Environment)
@@ -50,7 +82,52 @@ public sealed record AppSettings
     }
 }
 
-public sealed record VoiceStyle(int Id, string Name);
+/// <summary>
+/// AivisSpeech の AudioQuery に上書きする合成パラメーター。範囲は AivisSpeech Engine の API 仕様に合わせる。
+/// </summary>
+public sealed record VoiceTuning
+{
+    public double Speed { get; init; } = 1.08;
+    public double Intonation { get; init; } = 1;
+    public double Tempo { get; init; } = 1;
+    public double Pitch { get; init; }
+    public double Volume { get; init; } = 1;
+    public double PauseScale { get; init; } = 1;
+    public double PrePhoneme { get; init; } = 0.1;
+    public double PostPhoneme { get; init; } = 0.1;
+
+    internal static IReadOnlyList<TuningParameter> Parameters { get; } =
+    [
+        new("話速", "speedScale", 0.5, 2, "全体の話す速さ。1.00 が標準です。",
+            t => t.Speed, (t, v) => t with { Speed = v }),
+        new("感情表現", "intonationScale", 0, 2,
+            "選んだスタイルの感情表現の強さ。ノーマルスタイルでは自動で調整され、この値は使われません。",
+            t => t.Intonation, (t, v) => t with { Intonation = v }),
+        new("テンポの緩急", "tempoDynamicsScale", 0, 2, "大きいほど速さの緩急が付いた話し方になります。",
+            t => t.Tempo, (t, v) => t with { Tempo = v }),
+        new("音高", "pitchScale", -0.15, 0.15, "0.00 から変えると音質が下がることがあります。",
+            t => t.Pitch, (t, v) => t with { Pitch = v }),
+        new("音量", "volumeScale", 0, 2, "読み上げと内蔵の警報音の音量。",
+            t => t.Volume, (t, v) => t with { Volume = v }),
+        new("句読点の間", "pauseLengthScale", 0, 2, "句読点などで入る無音の長さの倍率。",
+            t => t.PauseScale, (t, v) => t with { PauseScale = v }),
+        new("前の無音", "prePhonemeLength", 0, 1.5, "話し始める前の無音 (秒)。長いほど警報の出音が遅れます。",
+            t => t.PrePhoneme, (t, v) => t with { PrePhoneme = v }),
+        new("後の無音", "postPhonemeLength", 0, 1.5, "話し終えた後の無音 (秒)。",
+            t => t.PostPhoneme, (t, v) => t with { PostPhoneme = v }),
+    ];
+
+    internal bool IsValid => Parameters.All(parameter => parameter.Accepts(parameter.Read(this)));
+}
+
+internal sealed record TuningParameter(
+    string Label, string QueryKey, double Min, double Max, string Hint,
+    Func<VoiceTuning, double> Read, Func<VoiceTuning, double, VoiceTuning> Write)
+{
+    internal bool Accepts(double value) => double.IsFinite(value) && value >= Min && value <= Max;
+}
+
+public sealed record VoiceStyle(int Id, string SpeakerUuid, string SpeakerName, string StyleName);
 
 public sealed record VoiceStatus(
     string Connection = "未接続",
