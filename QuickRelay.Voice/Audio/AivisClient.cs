@@ -78,20 +78,27 @@ internal sealed class AivisClient : IDisposable
         var voices = await ListVoicesAsync(ct).ConfigureAwait(false);
         AivisVoice? voice = null;
 
-        if (!string.IsNullOrWhiteSpace(options.SpeakerUuid))
-            voice = FindVoice(voices, candidate => candidate.SpeakerUuid.Equals(options.SpeakerUuid, StringComparison.OrdinalIgnoreCase)
-                && candidate.StyleName == options.StyleName);
-        if (voice is null && !string.IsNullOrWhiteSpace(options.SpeakerName))
-            voice = FindVoice(voices, candidate => candidate.SpeakerName == options.SpeakerName
-                && candidate.StyleName == options.StyleName);
-        if (voice is null && options.StyleId is int styleId)
+        // A style ID names one style exactly. The model (speaker UUID or name) is the fallback when that style
+        // disappears, for example after the model is reinstalled, and picks the configured style name within it.
+        if (options.StyleId is int styleId)
             voice = FindVoice(voices, candidate => candidate.StyleId == styleId);
+        if (voice is null && !string.IsNullOrWhiteSpace(options.SpeakerUuid))
+            voice = PickStyle(voices.Where(candidate =>
+                candidate.SpeakerUuid.Equals(options.SpeakerUuid, StringComparison.OrdinalIgnoreCase)));
+        if (voice is null && !string.IsNullOrWhiteSpace(options.SpeakerName))
+            voice = PickStyle(voices.Where(candidate => candidate.SpeakerName == options.SpeakerName));
 
         if (voice is null && string.IsNullOrWhiteSpace(options.SpeakerUuid)
             && string.IsNullOrWhiteSpace(options.SpeakerName) && options.StyleId is null)
-            voice = voices.FirstOrDefault(candidate => candidate.StyleName == options.StyleName) ?? voices.FirstOrDefault();
+            voice = PickStyle(voices);
 
         return voice ?? throw new SpeechEngineException("設定に一致するAivisSpeechの話者が見つかりませんでした。");
+    }
+
+    private AivisVoice? PickStyle(IEnumerable<AivisVoice> candidates)
+    {
+        var list = candidates.ToList();
+        return list.FirstOrDefault(candidate => candidate.StyleName == options.StyleName) ?? list.FirstOrDefault();
     }
 
     internal async Task<WaveClip> SynthesizeAsync(string text, int styleId, CancellationToken ct)
@@ -107,10 +114,12 @@ internal sealed class AivisClient : IDisposable
         try
         {
             query = JsonNode.Parse(data) as JsonObject ?? throw new JsonException();
-            if (query.ContainsKey("speedScale"))
-                query["speedScale"] = options.Speed;
-            if (query.ContainsKey("volumeScale"))
-                query["volumeScale"] = options.Volume;
+            // Only overwrite fields the engine returned, so engines without AivisSpeech-only fields keep working.
+            foreach (var parameter in VoiceTuning.Parameters)
+            {
+                if (query.ContainsKey(parameter.QueryKey))
+                    query[parameter.QueryKey] = parameter.Read(options.Tuning);
+            }
         }
         catch (JsonException ex)
         {

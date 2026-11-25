@@ -12,6 +12,7 @@
     <Version>0.2.0</Version>
   </PropertyGroup>
   <ItemGroup>
+    <InternalsVisibleTo Include="QuickRelay.Voice.Checks" />
     <ProjectReference Include="../QuickRelay.Voice.Core/QuickRelay.Voice.Core.csproj" />
   </ItemGroup>
 </Project>
