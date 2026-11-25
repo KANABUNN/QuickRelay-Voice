@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Security;
 
 namespace QuickRelay.Voice;
 
@@ -24,6 +25,7 @@ public sealed class MainForm : Form
     private readonly ToolStripMenuItem trayMute = new("消音") { CheckOnClick = true };
     private readonly TabControl tabs = new() { Dock = DockStyle.Fill };
     private readonly TabPage voiceTab = Page("音声");
+    private readonly TabPage residencyTab = Page("常駐");
 
     private readonly Label summary = new()
     {
@@ -67,6 +69,9 @@ public sealed class MainForm : Form
     private readonly CheckBox minimizeToTray = new() { Text = "最小化・閉じるボタンでタスクトレイに格納する", AutoSize = true };
     private readonly CheckBox startInTray = new() { Text = "起動時はウィンドウを開かずタスクトレイに格納する", AutoSize = true };
     private readonly CheckBox autoConnect = new() { Text = "起動時に保存済みの配信先へ接続する", AutoSize = true };
+    private readonly StartupRegistration startup = StartupRegistration.ForCurrentUser();
+    private readonly Button startupButton = ActionButton("スタートアップに追加");
+    private readonly Label startupHint = Note(string.Empty);
 
     private readonly Label actionHint = new()
     {
@@ -122,6 +127,7 @@ public sealed class MainForm : Form
         UpdateTokenHint();
         RenderStatus(lastStatus);
         UpdateOptions();
+        RenderStartup();
 
         nationwide.CheckedChanged += (_, _) => UpdateOptions();
         forecast.CheckedChanged += (_, _) => UpdateOptions();
@@ -156,9 +162,12 @@ public sealed class MainForm : Form
         saveVoice.Click += async (_, _) => await RunEngineActionAsync(SaveVoiceAsync, "音声設定を保存しています…");
         tabs.SelectedIndexChanged += async (_, _) =>
         {
+            if (tabs.SelectedTab == residencyTab)
+                RenderStartup();
             if (tabs.SelectedTab == voiceTab && !voicesLoaded)
                 await LoadVoicesQuietlyAsync();
         };
+        startupButton.Click += (_, _) => ToggleStartup();
         minimizeToTray.CheckedChanged += (_, _) => controller.SaveResidency(ReadResidency());
         startInTray.CheckedChanged += (_, _) => controller.SaveResidency(ReadResidency());
         autoConnect.CheckedChanged += (_, _) => controller.SaveResidency(ReadResidency());
@@ -450,16 +459,82 @@ public sealed class MainForm : Form
 
     private TabPage BuildResidencyPage()
     {
-        var page = Page("常駐");
         var grid = Grid(1);
         AddWide(grid, minimizeToTray);
         AddWide(grid, startInTray);
         AddWide(grid, autoConnect);
-        AddWide(grid, Note("タスクトレイのアイコンをクリックするとウィンドウを表示します。\n"
-            + "右クリックのメニューから、消音・再生停止・終了を選べます。\n\n"
-            + "アイコン右下の色\n緑: 読み上げ可能　黄: 消音または接続準備中\n赤: 異常　灰: 未接続"));
-        page.Controls.Add(grid);
-        return page;
+
+        AddWide(grid, SectionTitle("Windows のスタートアップ"));
+        startupButton.Margin = new Padding(0, 2, 0, 2);
+        AddWide(grid, startupButton);
+        AddWide(grid, startupHint);
+
+        AddWide(grid, SectionTitle("タスクトレイのアイコン"));
+        AddWide(grid, Note("クリックで画面を表示、右クリックで消音・再生停止・終了。\n"
+            + "右下の色　緑: 読み上げ可能　黄: 消音・接続準備中\n赤: 異常　灰: 未接続"));
+        residencyTab.Controls.Add(grid);
+        return residencyTab;
+    }
+
+    /// <summary>Shows whether Windows starts this copy of QRV at sign-in. Task Manager can change it, so it is re-read.</summary>
+    private void RenderStartup()
+    {
+        StartupState state;
+        string? registered;
+        bool disabled;
+        try
+        {
+            registered = startup.RegisteredCommand;
+            state = startup.State;
+            disabled = state == StartupState.On && startup.DisabledInTaskManager;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException)
+        {
+            startupButton.Enabled = false;
+            startupHint.Text = "スタートアップの登録状態を読み取れません。";
+            return;
+        }
+
+        startupButton.Text = state switch
+        {
+            StartupState.On => "スタートアップから削除",
+            StartupState.Elsewhere when startup.CanRegister => "この場所で登録し直す",
+            StartupState.Elsewhere => "スタートアップから削除",
+            _ => "スタートアップに追加"
+        };
+        startupButton.Enabled = state != StartupState.Off || startup.CanRegister;
+        startupHint.Text = state switch
+        {
+            StartupState.On => "登録済みです。サインイン時に QRV を起動します。"
+                + (disabled ? "\nタスクマネージャーで無効にされているため、今は起動しません。" : ""),
+            StartupState.Elsewhere => "別の場所の QRV が登録されています。\n" + registered,
+            _ when startup.CanRegister => "未登録です。登録するとサインイン時に QRV を起動します。",
+            _ => "実行ファイルの場所が分からないため、登録できません。"
+        } + "\n起動後の動作は、上の「起動時」の設定に従います。";
+    }
+
+    private void ToggleStartup()
+    {
+        try
+        {
+            var state = startup.State;
+            if (state == StartupState.On || state == StartupState.Elsewhere && !startup.CanRegister)
+            {
+                startup.Disable();
+                actionHint.Text = "Windows のスタートアップから削除しました。";
+            }
+            else
+            {
+                startup.Enable();
+                actionHint.Text = "Windows のスタートアップに追加しました。";
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SecurityException
+            or InvalidOperationException)
+        {
+            actionHint.Text = "スタートアップの登録を変更できませんでした。";
+        }
+        RenderStartup();
     }
 
     private void LoadSettings(AppSettings settings)

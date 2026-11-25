@@ -3,6 +3,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Microsoft.Win32;
 using QuickRelay.Voice;
 using QuickRelay.Voice.Audio;
 
@@ -16,7 +17,45 @@ internal static class VoiceChecks
         CheckSettings();
         await CheckQueryParametersAsync();
         await CheckVoiceSelectionAsync();
-        Console.WriteLine("PASS voice settings: saved settings from 0.2.0, tuning ranges, model fallback, AudioQuery parameters");
+        CheckStartup();
+        Console.WriteLine("PASS voice settings: saved settings from 0.2.0, tuning ranges, model fallback, AudioQuery parameters, startup entry");
+    }
+
+    private static void CheckStartup()
+    {
+        // A scratch key stands in for the user's Run and StartupApproved keys, so the real startup list is untouched.
+        const string root = @"Software\QuickRelay.Voice.Checks";
+        const string installed = @"C:\Program Files\QuickRelay Voice\QuickRelay Voice.exe";
+        Registry.CurrentUser.DeleteSubKeyTree(root, throwOnMissingSubKey: false);
+        try
+        {
+            var here = new StartupRegistration(root + @"\Run", root + @"\Approved", installed);
+            var moved = new StartupRegistration(root + @"\Run", root + @"\Approved", @"D:\Tools\QRV\QuickRelay Voice.exe");
+            var unknown = new StartupRegistration(root + @"\Run", root + @"\Approved", null);
+            Check(here.State == StartupState.Off && here.RegisteredCommand is null, "startup starts unregistered");
+
+            here.Enable();
+            Check(here.State == StartupState.On && here.RegisteredCommand == $"\"{installed}\"", "startup registers the quoted path");
+            Check(moved.State == StartupState.Elsewhere && unknown.State == StartupState.Elsewhere,
+                "another copy sees the entry as registered elsewhere");
+            Check(!here.DisabledInTaskManager, "a new entry is not disabled");
+            using (var approved = Registry.CurrentUser.CreateSubKey(root + @"\Approved"))
+                approved.SetValue(StartupRegistration.ValueName, new byte[] { 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 },
+                    RegistryValueKind.Binary);
+            Check(here.DisabledInTaskManager, "Task Manager's disabled flag is read");
+
+            moved.Enable();
+            Check(moved.State == StartupState.On && here.State == StartupState.Elsewhere, "registering again replaces the path");
+            here.Disable();
+            Check(here.State == StartupState.Off && moved.State == StartupState.Off, "removal clears the entry");
+            here.Disable();
+            Check(Throws<InvalidOperationException>(unknown.Enable) && unknown.State == StartupState.Off,
+                "a copy without a known executable cannot register");
+        }
+        finally
+        {
+            Registry.CurrentUser.DeleteSubKeyTree(root, throwOnMissingSubKey: false);
+        }
     }
 
     private static void CheckSettings()
