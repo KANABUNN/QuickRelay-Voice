@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <AssemblyName>QuickRelay Voice</AssemblyName>
+    <RootNamespace>QuickRelay.Voice</RootNamespace>
+    <Product>QuickRelay Voice</Product>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../QuickRelay.Voice.Core/QuickRelay.Voice.Core.csproj" />
+  </ItemGroup>
+</Project>
