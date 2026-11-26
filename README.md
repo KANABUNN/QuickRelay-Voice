@@ -29,6 +29,7 @@ dotnet run --project .\QuickRelay.Voice\QuickRelay.Voice.csproj
 
 - 続報では、変わった項目だけを「上昇」「低下」「変更」を付けて伝えます。対象は震源、予想最大震度、マグニチュード、深さ、長周期地震動階級（1以上のとき）、地域を絞っている場合はその地域の予想震度です。変化のない続報は読み上げず、最近の動作欄に理由を表示します。最終報は全項目を読み上げます。
 - 仮定震源（PLUM法など）の報には「震源は仮定」、1点観測の報には「1点観測」と付けます。その後の報で震源が推定されたときは「震源は〇〇と推定」、観測点が増えたときは「震源精度向上」と伝えます。
+- 地名は、AivisSpeech が読み違える部分を既定の読みに置き換えてから渡します（例：渡島 → オシマ、後志 → シリベシ、中越 → チュウエツ）。置き換えるのは震源名と地域名だけで、報番号や数値には使いません。読みの追加と変更は、下の `readings.json` でできます。
 - 警報地域は府県予報区の名前で読みます。同じ報に含まれる地方予報区と細分区域の名前は重ねて読みません。6件以上のときは5件の後に残りの件数を読みます。府県予報区が含まれない追加は、細分区域または地方予報区の名前で読みます。
 - 別の地震を読み上げた後に続報を読むときは、「石川県能登地方の地震、第4報。」のように震源名から始めます。
 - 予報より警報を優先します。警報が予報の読み上げを中断した場合、中断された報は警報の後で、前に読み上げた内容と比べて改めて読み上げます。
@@ -79,7 +80,17 @@ dotnet publish .\QuickRelay.Voice\QuickRelay.Voice.csproj -c Release -r win-x64 
 & '.\artifacts\publish\QuickRelay Voice.exe'
 ```
 
-`QuickRelay.Voice.Checks` は、QuickRelay PR #18に含まれる正式な配信例6件と、ローカルの TLS WSS フィクスチャを使います。購読、警報地域の出典、予報の読み上げ文と差分、証明書検証、Bearer認証、同期と再開、クローズコード、発話条件を確認できます。AivisSpeech の応答を模したハンドラーで、音声パラメーターの送信、モデルとスタイルの選択、0.2.0 の設定ファイルの読み込みも確認します。
+`QuickRelay.Voice.Checks` は、QuickRelay PR #18に含まれる正式な配信例6件と、ローカルの TLS WSS フィクスチャを使います。購読、警報地域の出典、予報の読み上げ文と差分、地名の読みの辞書、証明書検証、Bearer認証、同期と再開、クローズコード、発話条件を確認できます。AivisSpeech の応答を模したハンドラーで、音声パラメーターの送信、モデルとスタイルの選択、0.2.0 の設定ファイルの読み込みも確認します。
+
+### 地名の読みの確認
+
+AivisSpeech のエンジンやモデルを更新したときは、地名の読みを確かめます。AivisSpeech を起動した状態で実行します。
+
+```powershell
+dotnet run --project .\QuickRelay.Voice.ReadingCheck -c Release > readings-check.tsv
+```
+
+`QuickRelay.Voice.ReadingCheck/place-names.txt` の名称を、エンジンの `/accent_phrases` に通します。辞書を通さない読みと、辞書で置き換えた名称の読みを、タブ区切りで出力します。アクセント句の区切りは `/` です。ポート、スタイル、`readings.json` は QRV の保存先から読み込み、`--port`、`--style <ID>`、`--readings <パス>` で変えられます。ほかの名称の一覧（1行に1件）を引数に渡すこともできます。同梱の一覧は、2026-11-27 に確かめた代表の約140件で、全件ではありません。読み違いが見つかったら、`PlaceReadings` の既定の読みか `readings.json` に足します。
 
 ## 保存先
 
@@ -88,13 +99,13 @@ dotnet publish .\QuickRelay.Voice\QuickRelay.Voice.csproj -c Release -r win-x64 
 - トークンは Windows 資格情報マネージャーの汎用資格情報 `QuickRelay Voice/<接続先・環境のハッシュ>` に保存します。
 - スタートアップに追加すると、`HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` に値 `QuickRelay Voice`（実行ファイルのパス）を登録します。
 - 4410を受信したときは、失効済みトークンを識別するハッシュを `revoked-*.json` に保存します。アプリを再起動した場合も新しいトークンが必要です。
-- 同じフォルダーに `readings.json` を置くと、地名の音声表記を変更できます。JSON オブジェクトに `{"例示地域":"れいじちいき"}` の形式で指定すると、次回接続時に読み込みます。
+- 同じフォルダーに `readings.json` を置くと、地名の読みを追加・変更できます。JSON オブジェクトに `{"渡島":"おしま","例示地域":"れいじちいき"}` の形式で指定すると、次回接続時に読み込みます。キーは名称の一部でもよく、名称の中で一致した部分を置き換えます。重なるときは長いキーを優先し、既定の読みと同じキーは `readings.json` の指定で上書きします。空の読みや61文字以上の読みは使いません。
 
 出力の直前に報知開始記録を保存します。記録後から実際の出音までに異常終了した場合は、再起動後の重複防止を優先するため、その音声が流れないことがあります。
 
 ## QuickRelay PR-C との接続
 
-QuickRelay PR #18のマージコミット `bbea0b9` に含まれる正式なWSS v1契約に対応します。地域設定は `codeType` とコードの完全一致で判定します。予報は品質（`quality`）に関係なく読み上げます。契約では予報の最終報の `speechUntil` は `null`（発話の候補にしない）ですが、QRV は最終報も発表から10秒以内なら読み上げます。 [正式スキーマ](https://github.com/KANABUNN/QuickRelay/blob/bbea0b9380447db48f0885a5a027264cd5b40dd3/contracts/eew-wss.schema.json)
+QuickRelay PR #18のマージコミット `bbea0b9` に含まれる正式なWSS v1契約に対応します。地域設定は `codeType` とコードの完全一致で判定します。予報は品質（`quality`）に関係なく読み上げます。予報の最終報は、`speechUntil` が `null` でも、発表から10秒以内の期限が付いていても受け付け、どちらも発表から10秒以内なら読み上げます。QuickRelay の配信は現在 `null` です。 [正式スキーマ](https://github.com/KANABUNN/QuickRelay/blob/bbea0b9380447db48f0885a5a027264cd5b40dd3/contracts/eew-wss.schema.json)
 
 4409を受信すると保存カーソルを解除し、接続し直して全同期します。4410では自動再接続を止め、新しいトークンの入力を求めます。4400、4403、4413では購読、認可、上限エラーを表示して停止します。429では1分待ってから再接続します。 [QuickRelayのWSS運用資料](https://github.com/KANABUNN/QuickRelay/blob/bbea0b9380447db48f0885a5a027264cd5b40dd3/docs/eew-bridge.md)
 

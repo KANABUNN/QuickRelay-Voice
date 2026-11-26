@@ -11,7 +11,11 @@ public enum SpeechCategory { Alarm, Cancel, Update }
 
 public sealed record SpeechSettings(
     bool Nationwide, IReadOnlySet<RegionKey> Regions, bool ForecastEnabled, string ForecastThreshold,
-    IReadOnlyDictionary<string, string>? RegionReadings = null);
+    PlaceReadings? Readings = null)
+{
+    /// <summary>The place-name pronunciations in use: the defaults unless readings.json was loaded.</summary>
+    public PlaceReadings Places => Readings ?? PlaceReadings.Default;
+}
 
 /// <summary>What the listener has been told about an earthquake's forecast: the baseline for the next report.</summary>
 public sealed record ForecastFacts(
@@ -175,7 +179,7 @@ public static class SpeechPolicy
         var mark = new SpeechMark(earthquake.EventId, SeriesKind.Warning, SpeechKind.FirstWarning, warning.Revision,
             regions.Select(region => region.Region.Key).ToArray(), now);
         return new Announcement(earthquake.EventId, SpeechKind.FirstWarning,
-            $"対象地域は、{Names(regions.Select(region => region.Region), settings.RegionReadings)}です。",
+            $"対象地域は、{Names(regions.Select(region => region.Region), settings.Places)}です。",
             regions.Min(region => region.Source.IssuedAt!.Value), regions.Min(region => region.Until), [mark]);
     }
 
@@ -208,7 +212,7 @@ public static class SpeechPolicy
         }
 
         var full = facts is not null && (baseline is null || facts.Final);
-        var details = facts is null ? new List<string>() : Describe(facts, baseline, full, settings.RegionReadings);
+        var details = facts is null ? new List<string>() : Describe(facts, baseline, full, settings.Places);
         if (added.Count == 0 && details.Count == 0)
         {
             reason = $"{Report(facts!.Serial) ?? "続報"}は前回の読み上げから変化がありません";
@@ -232,14 +236,14 @@ public static class SpeechPolicy
             var lastSpoken = marks.LastOrDefault(mark => !IsCancel(mark.Kind))?.EventId;
             var name = facts?.Hypocenter ?? baseline?.Hypocenter;
             var prefix = lastSpoken != earthquake.EventId && !full && name is not null
-                ? $"{ReadName(name, settings.RegionReadings)}の地震、" : "";
+                ? $"{ReadName(name, settings.Places)}の地震、" : "";
             header = prefix + (report.Length == 0 ? "続報" : report) + "。";
         }
 
         var text = header;
         if (added.Count > 0)
         {
-            var names = Names(added.Select(region => region.Region), settings.RegionReadings);
+            var names = Names(added.Select(region => region.Region), settings.Places);
             text += heard.Count == 0 ? $"警報、対象地域は、{names}。" : $"警報地域追加、{names}。";
         }
         if (details.Count > 0)
@@ -289,7 +293,7 @@ public static class SpeechPolicy
         var whole = earthquake.Warning is null or { Status: SeriesStatus.Canceled }
             && earthquake.Forecast is null or { Status: SeriesStatus.Canceled };
         var name = history.LastOrDefault(mark => mark.Facts?.Hypocenter is not null)?.Facts!.Hypocenter;
-        var subject = name is null ? "緊急地震速報" : $"{ReadName(name, settings.RegionReadings)}の緊急地震速報";
+        var subject = name is null ? "緊急地震速報" : $"{ReadName(name, settings.Places)}の緊急地震速報";
         var label = whole ? "" : pending.Any(item => item.Series == SeriesKind.Warning) ? "、警報" : "、予報";
         var marksToSave = pending.Select(item => new SpeechMark(earthquake.EventId, item.Series, item.Kind,
             item.Value.Revision, [], now)).ToArray();
@@ -302,7 +306,7 @@ public static class SpeechPolicy
     /// A changed value carries its direction so the trend is clear from the voice alone.
     /// </summary>
     private static List<string> Describe(ForecastFacts facts, ForecastFacts? before, bool full,
-        IReadOnlyDictionary<string, string>? readings)
+        PlaceReadings readings)
     {
         var items = new List<string>();
         if (facts.Hypocenter is { } hypocenter)
@@ -428,7 +432,7 @@ public static class SpeechPolicy
     /// Names the regions at one level, preferring prefectures, so a report listing a district, its prefecture and
     /// its zone reads once. Long lists end with the count of the rest.
     /// </summary>
-    private static string Names(IEnumerable<WarningRegion> regions, IReadOnlyDictionary<string, string>? readings)
+    private static string Names(IEnumerable<WarningRegion> regions, PlaceReadings readings)
     {
         var list = regions.ToList();
         var level = Levels.FirstOrDefault(level => list.Any(region => region.Level == level)) ?? list[0].Level;
@@ -497,8 +501,6 @@ public static class SpeechPolicy
 
     private static string Name(string? code) => Code(code) is >= 0 and var index ? IntensityNames[index] : "不明";
 
-    private static string ReadName(string original, IReadOnlyDictionary<string, string>? readings)
-        => readings?.TryGetValue(original, out var pronunciation) == true
-            && !string.IsNullOrWhiteSpace(pronunciation) && pronunciation.Length <= 60 && !pronunciation.Any(char.IsControl)
-            ? pronunciation : !string.IsNullOrWhiteSpace(original) && original.Length <= 60 ? original : "対象地域";
+    private static string ReadName(string original, PlaceReadings readings)
+        => !string.IsNullOrWhiteSpace(original) && original.Length <= 60 ? readings.Read(original) : "対象地域";
 }

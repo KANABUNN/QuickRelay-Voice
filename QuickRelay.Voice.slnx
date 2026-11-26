@@ -1,5 +1,6 @@
 <Solution>
   <Project Path="QuickRelay.Voice.Checks/QuickRelay.Voice.Checks.csproj" />
   <Project Path="QuickRelay.Voice.Core/QuickRelay.Voice.Core.csproj" />
+  <Project Path="QuickRelay.Voice.ReadingCheck/QuickRelay.Voice.ReadingCheck.csproj" />
   <Project Path="QuickRelay.Voice/QuickRelay.Voice.csproj" />
 </Solution>

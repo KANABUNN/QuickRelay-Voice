@@ -90,7 +90,7 @@ public sealed class VoiceController : IDisposable
             catch (Exception ex) when (IsStorageError(ex)) { Log("地名の読み辞書を読み込めません。"); }
             settings = selected;
             policy = new SpeechSettings(selected.Nationwide, ReadRegions(selected.Nationwide ? [] : selected.Regions),
-                selected.ForecastEnabled, selected.ForecastThreshold, readings);
+                selected.ForecastEnabled, selected.ForecastThreshold, PlaceReadings.Default.With(readings));
             hasToken = true;
             markFile = announcementFile;
             state = null;

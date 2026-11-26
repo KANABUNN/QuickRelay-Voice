@@ -5,7 +5,7 @@ using QuickRelay.Voice.Core.Feed;
 FeedChecks.Run();
 ContractChecks.Run();
 CheckSpeech();
-Console.WriteLine("PASS speech policy: every report, differences from the last speech, final summary, warnings and cancellation");
+Console.WriteLine("PASS speech policy: every report, differences from the last speech, final summary, warnings, cancellation and place-name readings");
 await VoiceChecks.RunAsync();
 await TransportChecks.RunAsync();
 Console.WriteLine("QRV verification passed.");
@@ -83,6 +83,7 @@ static void CheckSpeech()
     CheckWarnings(now, nationwide);
     CheckRegions(now);
     CheckSavedHistory(now);
+    CheckReadings(now);
 
     FeedSeries Forecast(ulong revision, string serial, string intensity, double? magnitude, int? depth,
         string hypocenter = "石川県能登地方", ForecastQuality quality = ForecastQuality.Estimated, int? points = 1,
@@ -234,6 +235,43 @@ static void CheckRegions(DateTimeOffset now)
         .Contains("例示地域の予想震度5弱から5強") == true, "the chosen region's forecast keeps its range");
     Check(SpeechPolicy.FromLive(update, settings with { ForecastThreshold = "5+" }, [], now) is null,
         "the lower end of a range decides the minimum");
+}
+
+static void CheckReadings(DateTimeOffset now)
+{
+    var places = PlaceReadings.Default;
+    Check(places.Read("渡島地方北部") == "オシマ地方北部" && places.Read("後志地方西部") == "シリベシ地方西部",
+        "one default fixes every district that contains it");
+    Check(places.Read("新潟県上中越沖") == "新潟県じょうちゅうえつ沖" && places.Read("新潟県中越地方") == "新潟県チュウエツ地方",
+        "the longer key wins");
+    Check(places.Read("北海道道南") == "北海道ドウナン" && places.Read("東海道南方沖") == "東海道南方沖"
+        && places.Read("北海道南西沖") == "北海道南西沖", "a key does not reach into other names");
+    Check(places.Read("石川県能登地方") == "石川県能登地方", "names the engine reads correctly pass unchanged");
+
+    var custom = places.With(new Dictionary<string, string>
+    {
+        ["渡島"] = "おしま", ["渡島地方北部"] = "おしまほくぶ", ["例示地域"] = "れいじちいき",
+        ["空知"] = " ", ["長崎"] = new string('あ', 61)
+    });
+    Check(custom.Read("渡島地方北部") == "おしまほくぶ" && custom.Read("渡島地方東部") == "おしま地方東部",
+        "readings.json replaces a default, and a whole name beats a part");
+    Check(custom.Read("例示地域") == "れいじちいき", "whole-name entries of an earlier readings.json still work");
+    Check(custom.Read("空知地方中部") == "空知地方中部" && custom.Read("長崎県島原半島") == "長崎県島原半島",
+        "empty or overlong pronunciations are skipped");
+
+    // Readings touch place names only, never report numbers, figures or the fixed words around them.
+    var settings = new SpeechSettings(true, new HashSet<RegionKey>(), true, "0",
+        places.With(new Dictionary<string, string> { ["1"] = "いち", ["震度"] = "シンド" }));
+    var source = new FeedSource("JMA", "DMDATA", "VXSE45", "f1", "1", InfoType.Issue, now.AddSeconds(-1), null, now, now,
+        SourceOrigin.Live);
+    var quake = new FeedEvent("oshima", "test", 1, new FeedSeries(SeriesStatus.Active, 1, source,
+        new ForecastData(new ForecastHypocenter("100", "渡島地方東部", ForecastQuality.Estimated, 1), 4.1, 10,
+            new IntensityRange(IntensityKind.Exact, "4"), [], null), null, now.AddSeconds(9)), null);
+    var update = new StateMessage("test", "epoch", 100, DeliveryKind.Live, StateCause.Telegram, now, SeriesKind.Forecast, quake);
+    var job = SpeechPolicy.FromLive(update, settings, [], now)!;
+    Check(SpeechPolicy.Compose(job, quake, settings, [], now, out _)?.Text
+        == "緊急地震速報、予報、第1報。オシマ地方東部で地震、予想最大震度4、マグニチュード4.1、深さ10キロ。",
+        "the hypocenter is read through the dictionary, and nothing else is");
 }
 
 static void CheckSavedHistory(DateTimeOffset now)
