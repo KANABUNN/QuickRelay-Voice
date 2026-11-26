@@ -116,10 +116,7 @@ public sealed record ForecastData(
     IntensityRange MaxIntensity,
     IReadOnlyList<RegionForecast> RegionForecasts,
     IntensityRange? MaxLongPeriodClass,
-    DateTimeOffset? OriginTime = null)
-{
-    public bool HasReliableQuality => Hypocenter is { Quality: ForecastQuality.Estimated, MagnitudePoints: >= 2 };
-}
+    DateTimeOffset? OriginTime = null);
 
 public sealed class FeedProtocolException(string message, Exception? innerException = null)
     : Exception(message, innerException);

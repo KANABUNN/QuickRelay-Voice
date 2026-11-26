@@ -49,10 +49,6 @@ public sealed class MainForm : Form
     {
         AccessibleName = "予報の最低震度", DropDownStyle = ComboBoxStyle.DropDownList, Width = 110
     };
-    private readonly NumericUpDown step = new()
-    {
-        AccessibleName = "予報続報の震度差", Minimum = 1, Maximum = 9, Value = 1, Width = 64
-    };
 
     private readonly NumericUpDown port = new()
     {
@@ -404,8 +400,7 @@ public sealed class MainForm : Form
         AddField(grid, "対象地域コード", regions);
         AddField(grid, "予報", forecast);
         AddField(grid, "最低震度", threshold, fill: false);
-        AddField(grid, "続報の震度差", step);
-        AddField(grid, string.Empty, Note("震度階級の段数。4 → 5弱で1段。"));
+        AddField(grid, string.Empty, Note("最低震度に届いた地震は、最終報まで前の報との違いを読み上げます。"));
         AddWide(grid, Note("範囲の変更は「保存して接続」で反映します。"));
         page.Controls.Add(grid);
         return page;
@@ -551,7 +546,6 @@ public sealed class MainForm : Form
         }
         var selected = Array.FindIndex(Thresholds, value => value.Value == settings.ForecastThreshold);
         threshold.SelectedIndex = selected >= 0 ? selected : 4;
-        step.Value = Math.Clamp(settings.ForecastStep, (int)step.Minimum, (int)step.Maximum);
         port.Value = Math.Clamp(settings.AivisPort, (int)port.Minimum, (int)port.Maximum);
         selection = new VoiceSelection(settings.SpeakerUuid, settings.SpeakerName, settings.StyleId, settings.StyleName);
         RenderVoiceChoices();
@@ -587,7 +581,6 @@ public sealed class MainForm : Form
     {
         regions.Enabled = !nationwide.Checked;
         threshold.Enabled = forecast.Checked;
-        step.Enabled = forecast.Checked;
     }
 
     private void UpdateTokenHint()
@@ -605,7 +598,7 @@ public sealed class MainForm : Form
         {
             FeedUrl = feedUrl.Text.Trim(), Muted = muted.Checked,
             Nationwide = nationwide.Checked, Regions = regionKeys, ForecastEnabled = forecast.Checked,
-            ForecastThreshold = Thresholds[threshold.SelectedIndex].Value, ForecastStep = (int)step.Value
+            ForecastThreshold = Thresholds[threshold.SelectedIndex].Value
         }.WithVoiceFrom(ReadVoice()).WithResidencyFrom(ReadResidency());
         try
         {
