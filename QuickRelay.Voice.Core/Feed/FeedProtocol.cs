@@ -178,10 +178,7 @@ public static partial class FeedProtocol
             {
                 throw Invalid("data");
             }
-            if (status == SeriesStatus.Final && speechUntil is not null)
-            {
-                throw Invalid("speechUntil");
-            }
+            // A final forecast may come with or without a deadline; without one, QRV allows the same 10 seconds.
             VerifySpeechDeadline(source, speechUntil, kind == SeriesKind.Warning ? 15 : 10);
         }
 

@@ -71,6 +71,21 @@ internal static class ContractChecks
         };
         Expect(Words(missingQualityForecast, settings, issued)?.Contains("マグニチュード6.1") == true,
             "a forecast without a point count is still spoken");
+        // QuickRelay leaves a final forecast without a deadline; QRV also accepts one within the forecast's 10 seconds.
+        var finalReport = ReplaceFirst(ReadText("state"), "\"status\": \"active\"", "\"status\": \"final\"");
+        Expect(ParseState(finalReport).Event.Forecast is { Status: SeriesStatus.Final, SpeechUntil: not null },
+            "a final forecast with a deadline 10 seconds after issue is accepted");
+        Expect(ParseState(finalReport.Replace("\"speechUntil\": \"2026-11-24T03:00:28Z\"", "\"speechUntil\": null",
+            StringComparison.Ordinal)).Event.Forecast is { Status: SeriesStatus.Final, SpeechUntil: null },
+            "a final forecast without a deadline is accepted");
+        var lateFinal = finalReport.Replace("\"speechUntil\": \"2026-11-24T03:00:28Z\"", "\"speechUntil\": \"2026-11-24T03:00:29Z\"",
+            StringComparison.Ordinal);
+        try
+        {
+            ParseState(lateFinal);
+            Expect(false, "a final forecast deadline beyond 10 seconds is rejected");
+        }
+        catch (FeedProtocolException) { }
         var unknownFields = ParseState(ReadText("state").Replace("\"schemaVersion\": 1",
             "\"schemaVersion\": 1, \"futureDeliveryMetadata\": {}", StringComparison.Ordinal));
         Expect(unknownFields is { Seq: 1052 }, "optional future fields are ignored");
@@ -87,6 +102,11 @@ internal static class ContractChecks
     private static StateMessage ParseState(string json) => (StateMessage)FeedProtocol.Parse(Encoding.UTF8.GetBytes(json));
     private static FeedMessage Load(string name) => FeedProtocol.Parse(Read(name));
     private static string ReadText(string name) => Encoding.UTF8.GetString(Read(name));
+    private static string ReplaceFirst(string text, string old, string replacement)
+    {
+        var index = text.IndexOf(old, StringComparison.Ordinal);
+        return index < 0 ? text : string.Concat(text.AsSpan(0, index), replacement, text.AsSpan(index + old.Length));
+    }
     private static byte[] Read(string name) =>
         File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "ContractExamples", $"eew-{name}.valid.json"));
 
