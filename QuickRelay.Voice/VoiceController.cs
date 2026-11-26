@@ -19,9 +19,9 @@ public sealed class VoiceController : IDisposable
     private readonly VoiceFeedClient feed = new();
     private readonly Task speechWorker;
     private AppSettings settings;
-    private SpeechSettings policy = new(true, new HashSet<RegionKey>(), false, "4", 1);
+    private SpeechSettings policy = new(true, new HashSet<RegionKey>(), false, "4");
     private VoiceStatus status;
-    private bool hasToken, synchronized, currentStarted, warningPrepared, storageHealthy = true;
+    private bool hasToken, synchronized, currentStarted, preempted, warningPrepared, storageHealthy = true;
     private HealthMessage? health;
     private long healthTick;
     private FeedState? state;
@@ -90,7 +90,7 @@ public sealed class VoiceController : IDisposable
             catch (Exception ex) when (IsStorageError(ex)) { Log("地名の読み辞書を読み込めません。"); }
             settings = selected;
             policy = new SpeechSettings(selected.Nationwide, ReadRegions(selected.Nationwide ? [] : selected.Regions),
-                selected.ForecastEnabled, selected.ForecastThreshold, selected.ForecastStep, readings);
+                selected.ForecastEnabled, selected.ForecastThreshold, readings);
             hasToken = true;
             markFile = announcementFile;
             state = null;
@@ -105,7 +105,8 @@ public sealed class VoiceController : IDisposable
             try
             {
                 marks = LocalFiles.Read<List<SpeechMark>>(markFile, 8 * 1024 * 1024) ?? [];
-                if (marks.Count > MarkLimit || marks.Any(mark => mark is null || mark.Regions is null))
+                if (marks.Count > MarkLimit || marks.Any(mark => mark is null || mark.Regions is null
+                    || mark.Facts is { } facts && (facts.Regions is null || facts.MaxIntensity is null)))
                     throw new InvalidDataException("報知履歴の形式が無効です。");
             }
             catch (Exception ex) when (IsStorageError(ex))
@@ -423,7 +424,8 @@ public sealed class VoiceController : IDisposable
             if (result.LiveUpdate is { } live)
             {
                 var series = live.Event.GetSeries(live.ChangedSeries)!;
-                Log($"{Clip(live.Event.EventId)}　{series.Source.Code}　{SeriesLabel(series.Status)}　位置 {live.Seq}");
+                var serial = series.Source.Serial is { } number ? $"第{number}報　" : "";
+                Log($"{Clip(live.Event.EventId)}　{series.Source.Code}　{serial}{SeriesLabel(series.Status)}　位置 {live.Seq}");
                 if (settings.Muted && series.WarningData is { AddedRegions.Count: > 0 } warning)
                     Log("警報の追加地域　" + string.Join("、", warning.AddedRegions.Take(8).Select(region =>
                         $"{Clip(region.Name)} [{Clip(region.Key.CodeType)}:{Clip(region.Key.Code)}]")));
@@ -435,26 +437,13 @@ public sealed class VoiceController : IDisposable
         }
     }
 
+    /// <summary>A withdrawn earthquake stops everything but its cancellation notice.</summary>
     private void ApplyStops(FeedEvent earthquake)
     {
-        if (earthquake.Warning is not null || earthquake.Forecast?.Status != SeriesStatus.Active)
-        {
-            queue.RemoveAll(job => job.EventId == earthquake.EventId && job.Kind == SpeechKind.Forecast);
-            if (!currentStarted && current is { Kind: SpeechKind.Forecast } job && job.EventId == earthquake.EventId)
-                Cancel(playing);
-        }
-        if (earthquake.Warning?.Status == SeriesStatus.Canceled)
-            InvalidateSeries(earthquake.EventId, SeriesKind.Warning);
-        if (earthquake.Forecast?.Status == SeriesStatus.Canceled)
-            InvalidateSeries(earthquake.EventId, SeriesKind.Forecast);
-    }
-
-    private void InvalidateSeries(string eventId, SeriesKind kind)
-    {
-        queue.RemoveAll(job => job.EventId == eventId && job.Series == kind
-            && job.Kind is not (SpeechKind.ForecastCancel or SpeechKind.WarningCancel));
-        if (current is { } playingJob && playingJob.EventId == eventId && playingJob.Series == kind
-            && playingJob.Kind is not (SpeechKind.ForecastCancel or SpeechKind.WarningCancel))
+        if (earthquake.Warning?.Status != SeriesStatus.Canceled && earthquake.Forecast?.Status != SeriesStatus.Canceled)
+            return;
+        queue.RemoveAll(job => job.EventId == earthquake.EventId && job.Category != SpeechCategory.Cancel);
+        if (current is { } playingJob && playingJob.EventId == earthquake.EventId && playingJob.Category != SpeechCategory.Cancel)
             Cancel(playing);
     }
 
@@ -464,35 +453,52 @@ public sealed class VoiceController : IDisposable
             return;
         if (settings.Muted)
         {
-            Log($"無音検証　{Clip(job.EventId)}　{JobLabel(job.Kind)} の候補");
+            if (Compose(job, out _) is { } preview)
+                Log($"無音検証　{Clip(job.EventId)}　{Words(preview)}");
             return;
         }
         if (!storageHealthy || manualTest is not null)
             return;
-        if (queue.Any(item => item.EventId == job.EventId && item.Kind == job.Kind && item.Revision == job.Revision))
-            return;
 
         var now = FeedNow();
-        queue.RemoveAll(item => item.Until <= now || (item.EventId == job.EventId
-            && item.Kind == SpeechKind.Forecast && job.Kind == SpeechKind.Forecast));
-        if (queue.Count == QueueLimit)
+        queue.RemoveAll(item => item.Until <= now);
+        // Reports for one earthquake merge into one pending announcement; its words are chosen when it plays.
+        var index = queue.FindIndex(item => item.EventId == job.EventId && item.Category == job.Category);
+        if (index >= 0)
+            queue[index] = queue[index].Merge(job);
+        else
         {
-            var lowest = queue.Max(item => item.Kind);
-            if (lowest <= job.Kind)
+            if (queue.Count == QueueLimit)
             {
-                Log($"音声キュー満杯　{Clip(job.EventId)}　{JobLabel(job.Kind)} を保留");
-                SetStatus(status with { Output = "音声キュー満杯" });
-                return;
+                var lowest = queue.Max(item => item.Kind);
+                if (lowest <= job.Kind)
+                {
+                    Log($"音声キュー満杯　{Clip(job.EventId)}　{JobLabel(job.Kind)} を保留");
+                    SetStatus(status with { Output = "音声キュー満杯" });
+                    return;
+                }
+                queue.RemoveAt(queue.FindLastIndex(item => item.Kind == lowest));
             }
-            queue.RemoveAt(queue.FindLastIndex(item => item.Kind == lowest));
+            queue.Add(job);
         }
-        queue.Add(job);
-        if (current is { } playingJob && (job.Kind < playingJob.Kind
-            || (job.Kind == SpeechKind.Forecast && playingJob.Kind == SpeechKind.Forecast
-                && job.EventId == playingJob.EventId && job.Revision > playingJob.Revision)))
+        if (current is { } playingJob && job.Kind < playingJob.Kind)
+        {
+            preempted = true;
             Cancel(playing);
+        }
         if (speechReady.CurrentCount == 0)
             speechReady.Release();
+    }
+
+    private void Requeue(SpeechJob job)
+    {
+        if (job.Until <= FeedNow())
+            return;
+        var index = queue.FindIndex(item => item.EventId == job.EventId && item.Category == job.Category);
+        if (index >= 0)
+            queue[index] = queue[index].Merge(job);
+        else if (queue.Count < QueueLimit)
+            queue.Add(job);
     }
 
     private async Task PlayLoopAsync()
@@ -514,11 +520,11 @@ public sealed class VoiceController : IDisposable
                             break;
                         job = next;
                         queue.Remove(job);
-                        if (!CanStart(job))
+                        if (!CanDequeue(job))
                             continue;
                         speaker = audio;
                         current = job;
-                        currentStarted = false;
+                        currentStarted = preempted = false;
                         playing = playback = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
                         completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
                         playCompletion = completion.Task;
@@ -529,7 +535,7 @@ public sealed class VoiceController : IDisposable
                         lock (gate)
                         {
                             current = null;
-                            currentStarted = false;
+                            currentStarted = preempted = false;
                             playing = null;
                             completion.TrySetResult();
                         }
@@ -544,21 +550,32 @@ public sealed class VoiceController : IDisposable
     private async Task PlayAsync(SpeechJob job, AudioOutput speaker, CancellationToken ct)
     {
         var started = false;
+        IReadOnlyList<SpeechMark> recorded = [];
+        Announcement? chosen;
+        string reason;
+        lock (gate) chosen = Compose(job, out reason);
+        if (chosen is not { } announcement)
+        {
+            lock (gate) Log($"{Clip(job.EventId)}　{JobLabel(job.Kind)}　読み上げなし（{reason}）");
+            return;
+        }
+
         ValueTask<bool> Begin(CancellationToken cancellation)
         {
             lock (gate)
             {
-                if (cancellation.IsCancellationRequested || !CanStart(job))
+                if (cancellation.IsCancellationRequested || !CanSpeak(announcement))
                     return ValueTask.FromResult(false);
                 var now = FeedNow();
+                var stamped = announcement.StartAt(now);
                 var next = marks.Where(mark => now - mark.StartedAt < TimeSpan.FromHours(24)).ToList();
-                if (next.Count >= MarkLimit)
+                if (next.Count + stamped.Count > MarkLimit)
                 {
                     storageHealthy = false;
                     SetStatus(status with { Output = "報知履歴の上限に到達" });
                     return ValueTask.FromResult(false);
                 }
-                next.Add(job.Mark(now));
+                next.AddRange(stamped);
                 try { LocalFiles.Write(markFile, next); }
                 catch (Exception ex) when (IsStorageError(ex))
                 {
@@ -568,10 +585,12 @@ public sealed class VoiceController : IDisposable
                     return ValueTask.FromResult(false);
                 }
                 marks = next;
+                recorded = stamped;
                 currentStarted = started = true;
                 SetStatus(status with { Output = "再生中" });
-                Log($"音声開始　{Clip(job.EventId)}　{JobLabel(job.Kind)}　発表から {(now - job.IssuedAt).TotalMilliseconds:F0} ms");
-                return ValueTask.FromResult(FeedNow() < job.Until);
+                Log($"音声開始　{Clip(job.EventId)}　{JobLabel(announcement.Kind)}　発表から {(now - announcement.IssuedAt).TotalMilliseconds:F0} ms");
+                Log("読み上げ　" + Words(announcement));
+                return ValueTask.FromResult(FeedNow() < announcement.Until);
             }
         }
 
@@ -579,18 +598,16 @@ public sealed class VoiceController : IDisposable
         {
             lock (gate)
                 return ValueTask.FromResult(!cancellation.IsCancellationRequested
-                    && CanConsiderSpeech() && !settings.Muted && FeedNow() < job.Until
+                    && CanConsiderSpeech() && !settings.Muted && FeedNow() < announcement.Until
                     && state?.Events.TryGetValue(job.EventId, out var earthquake) == true
-                    && earthquake.Warning is { Status: SeriesStatus.Active, WarningData: { } warning }
-                    && job.Regions.All(key => warning.ActiveRegions.Any(region =>
-                        region.Key == key && region.SourceRef == job.TelegramId)));
+                    && SpeechPolicy.StillCurrent(announcement, earthquake));
         }
 
         async Task<bool> SpeakBeforeDeadline(string text, Func<CancellationToken, ValueTask<bool>> start,
             TimeSpan? synthesisBudget = null)
         {
             TimeSpan remaining;
-            lock (gate) remaining = job.Until - FeedNow();
+            lock (gate) remaining = announcement.Until - FeedNow();
             if (remaining <= TimeSpan.Zero)
                 return false;
             using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
@@ -608,23 +625,23 @@ public sealed class VoiceController : IDisposable
 
         try
         {
-            if (job.Kind == SpeechKind.FirstWarning)
+            if (announcement.Kind == SpeechKind.FirstWarning)
             {
                 var prepared = await speaker.PlayPreparedAsync(SpeechPolicy.FixedWarning, Begin, ct).ConfigureAwait(false);
                 if (prepared)
-                    await SpeakBeforeDeadline(job.Text, Continue, TimeSpan.FromMilliseconds(750)).ConfigureAwait(false);
+                    await SpeakBeforeDeadline(announcement.Text, Continue, TimeSpan.FromMilliseconds(750)).ConfigureAwait(false);
                 else if (!started)
                     await speaker.PlaySignalAsync(AudioSignal.Alert, Begin, ct).ConfigureAwait(false);
             }
             else
             {
-                var canUseTone = job.IsWarning;
+                var canUseTone = announcement.Kind == SpeechKind.WarningUpdate;
                 bool prepared;
                 lock (gate) prepared = warningPrepared;
                 try
                 {
                     if (!canUseTone || prepared)
-                        await SpeakBeforeDeadline(job.Text, Begin,
+                        await SpeakBeforeDeadline(announcement.Text, Begin,
                             canUseTone ? TimeSpan.FromSeconds(2) : null).ConfigureAwait(false);
                 }
                 catch (SpeechEngineException) when (canUseTone && !started)
@@ -639,7 +656,18 @@ public sealed class VoiceController : IDisposable
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
-            lock (gate) if (!settings.Muted && status.Output == "再生中") SetStatus(status with { Output = "待機中" });
+            lock (gate)
+            {
+                if (!settings.Muted && status.Output == "再生中")
+                    SetStatus(status with { Output = "待機中" });
+                // Speech cut off by a more urgent one is told again afterwards, against what was heard before it.
+                if (preempted && job.Category == SpeechCategory.Update)
+                {
+                    if (started)
+                        Forget(recorded);
+                    Requeue(job);
+                }
+            }
         }
         catch (SpeechEngineException)
         {
@@ -659,9 +687,43 @@ public sealed class VoiceController : IDisposable
         }
     }
 
-    private bool CanStart(SpeechJob job) => !settings.Muted && storageHealthy && manualTest is null && CanConsiderSpeech()
-        && state?.Events.TryGetValue(job.EventId, out var earthquake) == true
-        && SpeechPolicy.CanStart(job, earthquake, marks, FeedNow());
+    private Announcement? Compose(SpeechJob job, out string reason)
+    {
+        if (state?.Events.TryGetValue(job.EventId, out var earthquake) != true)
+        {
+            reason = "地震の状態がありません";
+            return null;
+        }
+        return SpeechPolicy.Compose(job, earthquake!, policy, marks, FeedNow(), out reason);
+    }
+
+    private void Forget(IReadOnlyList<SpeechMark> interrupted)
+    {
+        if (interrupted.Count == 0)
+            return;
+        var next = marks.Where(mark => !interrupted.Any(item => ReferenceEquals(item, mark))).ToList();
+        try
+        {
+            LocalFiles.Write(markFile, next);
+            marks = next;
+        }
+        catch (Exception ex) when (IsStorageError(ex))
+        {
+            storageHealthy = false;
+            Log("報知履歴の保存に失敗しました。音声を保留します。");
+            SetStatus(status with { Output = "報知履歴エラー" });
+        }
+    }
+
+    private bool CanDequeue(SpeechJob job) => !settings.Muted && storageHealthy && manualTest is null && CanConsiderSpeech()
+        && state?.Events.ContainsKey(job.EventId) == true && FeedNow() < job.Until;
+
+    private bool CanSpeak(Announcement announcement) => !settings.Muted && storageHealthy && manualTest is null
+        && CanConsiderSpeech() && state?.Events.TryGetValue(announcement.EventId, out var earthquake) == true
+        && SpeechPolicy.CanStart(announcement, earthquake, marks, FeedNow());
+
+    private static string Words(Announcement announcement)
+        => (announcement.Kind == SpeechKind.FirstWarning ? SpeechPolicy.FixedWarning : "") + announcement.Text;
 
     private bool CanConsiderSpeech()
         => synchronized && health is { Upstream: HealthStatus.Healthy, Capture: HealthStatus.Healthy } && ClockOkay();
@@ -689,6 +751,7 @@ public sealed class VoiceController : IDisposable
     private void StopAudioLocked()
     {
         queue.Clear();
+        preempted = false;
         Cancel(playing);
     }
 
@@ -725,7 +788,7 @@ public sealed class VoiceController : IDisposable
     {
         SpeechKind.FirstWarning => "警報",
         SpeechKind.WarningCancel => "警報取消",
-        SpeechKind.WarningUpdate => "警報地域追加",
+        SpeechKind.WarningUpdate => "警報続報",
         SpeechKind.ForecastCancel => "予報取消",
         _ => "予報"
     };

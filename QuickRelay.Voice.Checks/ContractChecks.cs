@@ -41,7 +41,7 @@ internal static class ContractChecks
             "snapshot commits the forecast cancellation as state");
 
         var data = state.Event.Forecast?.ForecastData;
-        Expect(data is { HasReliableQuality: true, Hypocenter.MagnitudePoints: 5,
+        Expect(data is { Hypocenter: { Quality: ForecastQuality.Estimated, MagnitudePoints: 5 },
             MaxIntensity: { Kind: IntensityKind.Range, Min: "5-", Max: "5+" } }, "nested forecast quality");
         Expect(data?.RegionForecasts is
         [
@@ -54,14 +54,14 @@ internal static class ContractChecks
             && warning.RegionSources?.ContainsKey("demo-w02") == true, "warning additions use their original Telegram deadlines");
 
         var issued = health.ServerTime;
-        var settings = new SpeechSettings(false, new HashSet<RegionKey> { new("地震情報／細分区域", "001") }, true, "4", 1);
+        var settings = new SpeechSettings(false, new HashSet<RegionKey> { new("地震情報／細分区域", "001") }, true, "4");
         Expect(SpeechPolicy.FromLive(state, settings, [], issued) is { Kind: SpeechKind.FirstWarning },
             "only the actually added region speaks");
         var existingRegion = new HashSet<RegionKey> { new("地震情報／細分区域", "000") };
         settings = settings with { Regions = existingRegion };
         Expect(SpeechPolicy.FromLive(state, settings, [], issued) is null, "a current warning does not repeat old regions");
         var forecastOnly = state with { ChangedSeries = SeriesKind.Forecast, Event = state.Event with { Warning = null } };
-        Expect(SpeechPolicy.FromLive(forecastOnly, settings, [], issued)?.Text.Contains("震度5強") == true,
+        Expect(Words(forecastOnly, settings, issued)?.Contains("例示地域の予想震度5強") == true,
             "configured regional forecast uses the regional intensity from the official shape");
         var missingQualityNumber = ParseState(ReadText("state").Replace(", \"magnitudePoints\": 5", "", StringComparison.Ordinal));
         var missingQualityForecast = missingQualityNumber with
@@ -69,8 +69,8 @@ internal static class ContractChecks
             ChangedSeries = SeriesKind.Forecast,
             Event = missingQualityNumber.Event with { Warning = null }
         };
-        Expect(SpeechPolicy.FromLive(missingQualityForecast, settings, [], issued) is null,
-            "estimated forecast without a point count stays silent");
+        Expect(Words(missingQualityForecast, settings, issued)?.Contains("マグニチュード6.1") == true,
+            "a forecast without a point count is still spoken");
         var unknownFields = ParseState(ReadText("state").Replace("\"schemaVersion\": 1",
             "\"schemaVersion\": 1, \"futureDeliveryMetadata\": {}", StringComparison.Ordinal));
         Expect(unknownFields is { Seq: 1052 }, "optional future fields are ignored");
@@ -79,6 +79,10 @@ internal static class ContractChecks
         Expect(nullableReceived.Event.Forecast?.Source.ReceivedAt is null, "a null reception time is valid data");
         Console.WriteLine("PASS QuickRelay PR #18 official contract examples: subscribe, resume, snapshot, series and regional metadata");
     }
+
+    private static string? Words(StateMessage update, SpeechSettings settings, DateTimeOffset now)
+        => SpeechPolicy.FromLive(update, settings, [], now) is { } job
+            ? SpeechPolicy.Compose(job, update.Event, settings, [], now, out _)?.Text : null;
 
     private static StateMessage ParseState(string json) => (StateMessage)FeedProtocol.Parse(Encoding.UTF8.GetBytes(json));
     private static FeedMessage Load(string name) => FeedProtocol.Parse(Read(name));

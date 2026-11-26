@@ -13,7 +13,6 @@ public sealed record AppSettings
     public string[] Regions { get; init; } = [];
     public bool ForecastEnabled { get; init; }
     public string ForecastThreshold { get; init; } = "4";
-    public int ForecastStep { get; init; } = 1;
     public int AivisPort { get; init; } = 10101;
     public int? StyleId { get; init; }
     public string? SpeakerUuid { get; init; }
@@ -36,9 +35,8 @@ public sealed record AppSettings
             || Regions.Any(region => region is null || region.Split(':') is not [var type, var code]
                 || string.IsNullOrWhiteSpace(type) || string.IsNullOrWhiteSpace(code)))))
             throw new ArgumentException("対象地域をコード種別:コードの形式で指定してください。");
-        if (ForecastThreshold is not ("0" or "1" or "2" or "3" or "4" or "5-" or "5+" or "6-" or "6+" or "7")
-            || ForecastStep is < 1 or > 9)
-            throw new ArgumentException("予報の震度しきい値と続報の差分を確認してください。");
+        if (ForecastThreshold is not ("0" or "1" or "2" or "3" or "4" or "5-" or "5+" or "6-" or "6+" or "7"))
+            throw new ArgumentException("予報の最低震度を確認してください。");
         ValidateVoice();
         return uri;
     }
