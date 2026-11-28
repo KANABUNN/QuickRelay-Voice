@@ -17,8 +17,42 @@ internal static class VoiceChecks
         CheckSettings();
         await CheckQueryParametersAsync();
         await CheckVoiceSelectionAsync();
+        await CheckSynthesisAheadAsync();
         CheckStartup();
-        Console.WriteLine("PASS voice settings: saved settings from 0.2.0, tuning ranges, model fallback, AudioQuery parameters, startup entry");
+        Console.WriteLine("PASS voice settings: saved settings from 0.2.0, tuning ranges, model fallback, AudioQuery parameters, synthesis ahead of playback, startup entry");
+    }
+
+    private static async Task CheckSynthesisAheadAsync()
+    {
+        // A new warning's region list is made while the fixed warning plays, so it must not wait for anything else.
+        var slow = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var engine = new FakeEngine { HoldSynthesis = slow };
+        using var http = new HttpClient(engine);
+        await using var output = new AudioOutput(new AudioOptions { StyleId = 888753760 }, http);
+        var ahead = output.SynthesizeAheadAsync("対象地域は、石川県能登です。", CancellationToken.None);
+        Check(await engine.SynthesisStarted.WaitAsync(TimeSpan.FromSeconds(5)) && !ahead.IsCompleted,
+            "synthesis ahead reaches the engine without being awaited");
+        slow.SetResult();
+        Check((await ahead.WaitAsync(TimeSpan.FromSeconds(5))).Samples.Length == 4, "synthesis ahead returns the speech");
+
+        // When the list is still not ready at the deadline after the warning, it is left out instead of starting late.
+        engine.HoldSynthesis = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var unused = new CancellationTokenSource();
+        var late = output.SynthesizeAheadAsync("対象地域は、富山県東部です。", unused.Token);
+        Check(await engine.SynthesisStarted.WaitAsync(TimeSpan.FromSeconds(5)), "the second synthesis reaches the engine");
+        using (var deadline = new CancellationTokenSource(TimeSpan.FromMilliseconds(50)))
+        {
+            var asked = false;
+            Check(await ThrowsAsync<OperationCanceledException>(() => output.SpeakAsync(late,
+                _ => { asked = true; return ValueTask.FromResult(true); }, deadline.Token)) && !asked,
+                "speech not ready by the deadline does not start");
+        }
+
+        // Cancelling speech that will not be played frees the engine for the next announcement.
+        await unused.CancelAsync();
+        Check(await ThrowsAsync<OperationCanceledException>(() => late), "unused synthesis ahead stops when cancelled");
+        Check((await output.ListVoicesAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5))).Count == 4,
+            "the engine is free after unused synthesis ahead is cancelled");
     }
 
     private static void CheckStartup()
@@ -178,6 +212,9 @@ internal static class VoiceChecks
     {
         public bool OmitAivisFields { get; init; }
         public JsonObject? SynthesisBody { get; private set; }
+        /// <summary>While set and not completed, synthesis requests wait, like a slow engine.</summary>
+        public TaskCompletionSource? HoldSynthesis { get; set; }
+        public SemaphoreSlim SynthesisStarted { get; } = new(0);
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
@@ -205,6 +242,9 @@ internal static class VoiceChecks
             if (path == "/synthesis")
             {
                 SynthesisBody = JsonNode.Parse(await request.Content!.ReadAsStringAsync(ct)) as JsonObject;
+                SynthesisStarted.Release();
+                if (HoldSynthesis is { } hold)
+                    await hold.Task.WaitAsync(ct);
                 return new HttpResponseMessage(HttpStatusCode.OK) { Content = new ByteArrayContent(Wave()) };
             }
             return new HttpResponseMessage(HttpStatusCode.NotFound);

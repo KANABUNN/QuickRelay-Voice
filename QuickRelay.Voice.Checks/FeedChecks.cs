@@ -9,6 +9,37 @@ internal static class FeedChecks
         ParseV1AndProvenance();
         CommitMultipartSnapshotAndResume();
         KeepTheWarningWhenForecastEnds();
+        TimeDeliveryWithoutTheLocalClock();
+    }
+
+    private static void TimeDeliveryWithoutTheLocalClock()
+    {
+        // The PC's monotonic clock reads 1000 s ahead of the server; the network takes 15 ms at best.
+        var update = (StateMessage)Parse(StateJson);
+        var received = update.Event.Warning!.Source.ReceivedAt!.Value;
+        update = update with { CommittedAt = received.AddMilliseconds(12) };
+        var ahead = TimeSpan.FromSeconds(1000);
+        TimeSpan Local(DateTimeOffset server, int networkMs) =>
+            server - DateTimeOffset.UnixEpoch + ahead + TimeSpan.FromMilliseconds(networkMs);
+        var arrival = Local(update.CommittedAt, 15 + 20);
+
+        var latency = new FeedLatency();
+        Check(latency.Measure(update, arrival) == new FeedDelay(TimeSpan.FromMilliseconds(12), null),
+            "time at the server is known before any heartbeat, delivery is not");
+        latency.Heartbeat(received.AddSeconds(-10), Local(received.AddSeconds(-10), 40));
+        latency.Heartbeat(received.AddSeconds(-5), Local(received.AddSeconds(-5), 15));
+        latency.Heartbeat(received, Local(received, 25));
+        Check(latency.Measure(update, arrival) == new FeedDelay(TimeSpan.FromMilliseconds(12), TimeSpan.FromMilliseconds(20)),
+            "delivery is the delay beyond the fastest heartbeat, whatever the clock difference");
+        Check(latency.Measure(update with { Cause = StateCause.Reconcile }, arrival).AtServer is null,
+            "a reconciled update has no telegram to time");
+
+        for (var beat = 1; beat <= 60; beat++)
+            latency.Heartbeat(received.AddSeconds(5 * beat), Local(received.AddSeconds(5 * beat), 30));
+        Check(latency.Measure(update, arrival).Delivery == TimeSpan.FromMilliseconds(5),
+            "heartbeats older than five minutes are forgotten");
+        latency.Reset();
+        Check(latency.Measure(update, arrival).Delivery is null, "a new connection starts without a baseline");
     }
 
     private static void ParseV1AndProvenance()
