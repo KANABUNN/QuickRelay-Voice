@@ -108,6 +108,29 @@ public sealed class AudioOutput : IAsyncDisposable
         return await PlayAsync(clip, mayStart, token).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Starts synthesizing <paramref name="text"/> at once, so it can be made while other audio plays. Play the
+    /// result with <see cref="SpeakAsync(Task{WaveClip}, Func{CancellationToken, ValueTask{bool}}, CancellationToken)"/>,
+    /// and cancel <paramref name="ct"/> when it will not be played, which frees the engine for other speech.
+    /// </summary>
+    internal async Task<WaveClip> SynthesizeAheadAsync(string text, CancellationToken ct)
+    {
+        using var operation = Link(ct);
+        return prepared.TryGetValue(text, out var clip) ? clip
+            : await SynthesizeAsync(text, operation.Token).ConfigureAwait(false);
+    }
+
+    /// <summary>Plays speech started with <see cref="SynthesizeAheadAsync"/>, waiting for it if it is not ready.</summary>
+    internal async Task<bool> SpeakAsync(
+        Task<WaveClip> synthesis, Func<CancellationToken, ValueTask<bool>> mayStart, CancellationToken ct)
+    {
+        using var operation = Link(ct);
+        var token = operation.Token;
+        var clip = await synthesis.WaitAsync(token).ConfigureAwait(false);
+        token.ThrowIfCancellationRequested();
+        return await PlayAsync(clip, mayStart, token).ConfigureAwait(false);
+    }
+
     public async Task<bool> PlayPreparedAsync(
         string text, Func<CancellationToken, ValueTask<bool>> mayStart, CancellationToken ct)
     {

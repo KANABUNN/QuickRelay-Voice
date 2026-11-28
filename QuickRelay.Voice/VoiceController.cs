@@ -17,6 +17,9 @@ public sealed class VoiceController : IDisposable
     private readonly SemaphoreSlim speechReady = new(0, 1);
     private readonly List<SpeechJob> queue = [];
     private readonly VoiceFeedClient feed = new();
+    private readonly FeedLatency latency = new();
+    // When the latest report of each earthquake reached QRV, as Stopwatch timestamps, to time the speech that follows.
+    private readonly Dictionary<string, long> arrivals = new(StringComparer.Ordinal);
     private readonly Task speechWorker;
     private AppSettings settings;
     private SpeechSettings policy = new(true, new HashSet<RegionKey>(), false, "4");
@@ -384,6 +387,8 @@ public sealed class VoiceController : IDisposable
 
     private void Receive(FeedApplyResult result, string cursorFile, CancellationToken ct)
     {
+        // Taken before waiting for the lock, so the delivery times leave out QRV's own work.
+        var arrival = Stopwatch.GetTimestamp();
         lock (gate)
         {
             if (ct.IsCancellationRequested || connection is null)
@@ -391,7 +396,8 @@ public sealed class VoiceController : IDisposable
             if (result.Health is { } heartbeat)
             {
                 health = heartbeat;
-                healthTick = Stopwatch.GetTimestamp();
+                healthTick = arrival;
+                latency.Heartbeat(heartbeat.ServerTime, Stopwatch.GetElapsedTime(0, arrival));
                 if (!ClockOkay())
                     StopAudioLocked();
                 if (heartbeat.Upstream != HealthStatus.Healthy || heartbeat.Capture != HealthStatus.Healthy)
@@ -425,7 +431,13 @@ public sealed class VoiceController : IDisposable
             {
                 var series = live.Event.GetSeries(live.ChangedSeries)!;
                 var serial = series.Source.Serial is { } number ? $"第{number}報　" : "";
-                Log($"{Clip(live.Event.EventId)}　{series.Source.Code}　{serial}{SeriesLabel(series.Status)}　位置 {live.Seq}");
+                Log($"{Clip(live.Event.EventId)}　{series.Source.Code}　{serial}{SeriesLabel(series.Status)}　位置 {live.Seq}"
+                    + DelayText(latency.Measure(live, Stopwatch.GetElapsedTime(0, arrival))));
+                var stale = arrivals.Where(pair => Stopwatch.GetElapsedTime(pair.Value) > TimeSpan.FromHours(1))
+                    .Select(pair => pair.Key).ToList();
+                foreach (var eventId in stale)
+                    arrivals.Remove(eventId);
+                arrivals[live.Event.EventId] = arrival;
                 if (settings.Muted && series.WarningData is { AddedRegions.Count: > 0 } warning)
                     Log("警報の追加地域　" + string.Join("、", warning.AddedRegions.Take(8).Select(region =>
                         $"{Clip(region.Name)} [{Clip(region.Key.CodeType)}:{Clip(region.Key.Code)}]")));
@@ -553,7 +565,12 @@ public sealed class VoiceController : IDisposable
         IReadOnlyList<SpeechMark> recorded = [];
         Announcement? chosen;
         string reason;
-        lock (gate) chosen = Compose(job, out reason);
+        long? arrived;
+        lock (gate)
+        {
+            chosen = Compose(job, out reason);
+            arrived = arrivals.TryGetValue(job.EventId, out var tick) ? tick : null;
+        }
         if (chosen is not { } announcement)
         {
             lock (gate) Log($"{Clip(job.EventId)}　{JobLabel(job.Kind)}　読み上げなし（{reason}）");
@@ -588,7 +605,8 @@ public sealed class VoiceController : IDisposable
                 recorded = stamped;
                 currentStarted = started = true;
                 SetStatus(status with { Output = "再生中" });
-                Log($"音声開始　{Clip(job.EventId)}　{JobLabel(announcement.Kind)}　発表から {(now - announcement.IssuedAt).TotalMilliseconds:F0} ms");
+                Log($"音声開始　{Clip(job.EventId)}　{JobLabel(announcement.Kind)}　発表から {(now - announcement.IssuedAt).TotalMilliseconds:F0} ms"
+                    + (arrived is { } received ? $"　QRV受信から {Ms(Stopwatch.GetElapsedTime(received))}" : ""));
                 Log("読み上げ　" + Words(announcement));
                 return ValueTask.FromResult(FeedNow() < announcement.Until);
             }
@@ -603,8 +621,9 @@ public sealed class VoiceController : IDisposable
                     && SpeechPolicy.StillCurrent(announcement, earthquake));
         }
 
+        // The synthesis budget limits the wait before the speech starts; synthesis started ahead counts only from here.
         async Task<bool> SpeakBeforeDeadline(string text, Func<CancellationToken, ValueTask<bool>> start,
-            TimeSpan? synthesisBudget = null)
+            TimeSpan? synthesisBudget = null, Task<WaveClip>? ahead = null)
         {
             TimeSpan remaining;
             lock (gate) remaining = announcement.Until - FeedNow();
@@ -612,13 +631,16 @@ public sealed class VoiceController : IDisposable
                 return false;
             using var deadline = CancellationTokenSource.CreateLinkedTokenSource(ct);
             deadline.CancelAfter(synthesisBudget is { } budget && budget < remaining ? budget : remaining);
+            ValueTask<bool> Started(CancellationToken token)
+            {
+                deadline.CancelAfter(Timeout.InfiniteTimeSpan);
+                return start(token);
+            }
             try
             {
-                return await speaker.SpeakAsync(text, token =>
-                {
-                    deadline.CancelAfter(Timeout.InfiniteTimeSpan);
-                    return start(token);
-                }, deadline.Token).ConfigureAwait(false);
+                return await (ahead is null
+                    ? speaker.SpeakAsync(text, Started, deadline.Token)
+                    : speaker.SpeakAsync(ahead, Started, deadline.Token)).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (!ct.IsCancellationRequested) { return false; }
         }
@@ -627,11 +649,30 @@ public sealed class VoiceController : IDisposable
         {
             if (announcement.Kind == SpeechKind.FirstWarning)
             {
-                var prepared = await speaker.PlayPreparedAsync(SpeechPolicy.FixedWarning, Begin, ct).ConfigureAwait(false);
-                if (prepared)
-                    await SpeakBeforeDeadline(announcement.Text, Continue, TimeSpan.FromMilliseconds(750)).ConfigureAwait(false);
-                else if (!started)
-                    await speaker.PlaySignalAsync(AudioSignal.Alert, Begin, ct).ConfigureAwait(false);
+                // The region list is made while the prepared warning plays, so it follows the warning without a gap.
+                using var unused = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                var regions = speaker.SynthesizeAheadAsync(announcement.Text, unused.Token);
+                try
+                {
+                    var prepared = await speaker.PlayPreparedAsync(SpeechPolicy.FixedWarning, Begin, ct).ConfigureAwait(false);
+                    if (prepared)
+                    {
+                        var spoken = await SpeakBeforeDeadline(announcement.Text, Continue, TimeSpan.FromMilliseconds(750),
+                            regions).ConfigureAwait(false);
+                        if (!spoken && !regions.IsCompleted)
+                            lock (gate) Log($"対象地域の音声合成が間に合わず省略　{Clip(job.EventId)}");
+                    }
+                    else if (!started)
+                        await speaker.PlaySignalAsync(AudioSignal.Alert, Begin, ct).ConfigureAwait(false);
+                }
+                finally
+                {
+                    // Nothing outlives this announcement, so the engine is free for the next one. A synthesis failure
+                    // that mattered was raised when the list was played; any other is no longer of interest.
+                    await unused.CancelAsync().ConfigureAwait(false);
+                    await ((Task)regions).ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing);
+                    _ = regions.Exception;
+                }
             }
             else
             {
@@ -745,6 +786,8 @@ public sealed class VoiceController : IDisposable
     {
         synchronized = false;
         health = null;
+        latency.Reset();
+        arrivals.Clear();
         StopAudioLocked();
     }
 
@@ -774,6 +817,16 @@ public sealed class VoiceController : IDisposable
     private static bool IsStorageError(Exception error) =>
         error is IOException or UnauthorizedAccessException or JsonException or InvalidDataException;
 
+    /// <summary>The delay from QuickRelay's reception of the telegram, split at the commit on the server.</summary>
+    private static string DelayText(FeedDelay delay) => delay switch
+    {
+        { AtServer: { } server, Delivery: { } delivery } =>
+            $"　VPS受信→QRV受信 {Ms(server + delivery)}（VPS内 {Ms(server)}・配信 {Ms(delivery)}）",
+        { Delivery: { } delivery } => $"　VPS確定→QRV受信 {Ms(delivery)}",
+        { AtServer: { } server } => $"　VPS受信→確定 {Ms(server)}",
+        _ => ""
+    };
+    private static string Ms(TimeSpan value) => $"{value.TotalMilliseconds:F0} ms";
     private static string HealthLabel(HealthStatus status) => status == HealthStatus.Healthy ? "正常" : "異常";
     private static string CursorText(FeedCursor? cursor) =>
         cursor is null ? "—" : $"{Clip(cursor.StreamId)} / {Clip(cursor.Epoch)} / {cursor.Seq}";
